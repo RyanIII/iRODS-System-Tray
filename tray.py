@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QStyle, QSystemTrayIcon
 
-from config import ConfigStore, normalize_directory
+from config import ConfigStore, IRODSEnvironmentStore, normalize_directory
+from irods_worker import IRODSUploadWorker
 from monitor import MonitorManager
 from ui import SettingsWindow
 
@@ -21,6 +22,8 @@ class TrayController(QObject):
     icon behavior so monitoring can continue while the window stays hidden.
     """
 
+    queue_upload = Signal(str, str)
+
     def __init__(self, app: QApplication) -> None:
         """Build the tray icon, menu, monitor, and settings window for the app."""
 
@@ -29,9 +32,17 @@ class TrayController(QObject):
         self.app.setQuitOnLastWindowClosed(False)
 
         self.config_store = ConfigStore()
+        self.irods_environment_store = IRODSEnvironmentStore()
+        self.irods_environment_store.ensure_exists()
         self.config = self.config_store.load()
         self.monitor = MonitorManager()
         self.window = SettingsWindow()
+        self._queued_uploads: set[str] = set()
+
+        self.upload_thread = QThread(self)
+        self.upload_worker = IRODSUploadWorker(self.irods_environment_store)
+        self.upload_worker.moveToThread(self.upload_thread)
+        self.upload_thread.start()
 
         self.monitor_toggle_action = QAction("Toggle Monitoring", self)
         self.monitor_toggle_action.setCheckable(True)
@@ -49,6 +60,7 @@ class TrayController(QObject):
         self._build_menu()
         self._connect_signals()
         self._sync_from_config()
+        self.window.set_irods_environment(self.irods_environment_store.load())
         self.tray_icon.show()
 
     def show_window(self) -> None:
@@ -109,8 +121,36 @@ class TrayController(QObject):
 
         self.config_store.save(self.config)
         self.monitor.shutdown()
+        self.upload_thread.quit()
+        self.upload_thread.wait(5000)
         self.tray_icon.hide()
         self.app.quit()
+
+    def save_irods_settings(self) -> None:
+        """Persist the iRODS session settings entered in the settings window."""
+
+        environment = self.window.get_irods_environment()
+        if not all(
+            [
+                environment.irods_host,
+                environment.irods_user_name,
+                environment.irods_password,
+                environment.irods_zone_name,
+                environment.irods_default_vault,
+            ]
+        ):
+            self.window.set_status_message(
+                "Complete all iRODS fields before saving.",
+                is_error=True,
+            )
+            return
+
+        self.irods_environment_store.save(environment)
+        self.window.set_irods_environment(self.irods_environment_store.load())
+        self.window.set_status_message("Saved iRODS settings.")
+        self.window.append_activity(
+            f"saved iRODS settings for {environment.irods_user_name}@{environment.irods_host}:{environment.irods_port}"
+        )
 
     def _build_icon(self):
         """Return a standard fallback icon so the tray works without bundled assets."""
@@ -133,9 +173,16 @@ class TrayController(QObject):
 
         self.window.add_folder_requested.connect(self.prompt_add_directory)
         self.window.remove_folder_requested.connect(self.remove_directory)
+        self.window.save_irods_requested.connect(self.save_irods_settings)
         self.window.monitoring_toggled.connect(self.set_monitoring_active)
         self.monitor.file_event.connect(self._handle_file_event)
+        self.monitor.ingest_requested.connect(self._queue_ingestion)
         self.monitor.monitor_error.connect(self._handle_monitor_error)
+        self.queue_upload.connect(self.upload_worker.upload_file)
+        self.upload_worker.upload_started.connect(self._handle_upload_started)
+        self.upload_worker.upload_progress.connect(self._handle_upload_progress)
+        self.upload_worker.upload_finished.connect(self._handle_upload_finished)
+        self.upload_worker.upload_failed.connect(self._handle_upload_failed)
 
     def _sync_from_config(self, *, show_status: bool = True) -> None:
         """Push the current config into the monitor, tray menu, and visible window.
@@ -195,8 +242,81 @@ class TrayController(QObject):
         entry_type = "folder" if is_directory else "file"
         self.window.append_activity(f"{event_type}: {entry_type} -> {path}")
 
+    def _queue_ingestion(self, path: str) -> None:
+        """Forward created and moved files to the iRODS worker thread once per path."""
+
+        if not self.config.is_monitoring_active:
+            return
+
+        normalized_path = str(Path(path).expanduser().resolve(strict=False))
+        monitored_root = self._match_monitored_directory(normalized_path)
+        if monitored_root is None:
+            return
+        if normalized_path in self._queued_uploads:
+            return
+
+        self._queued_uploads.add(normalized_path)
+        self.window.append_activity(f"queued upload -> {normalized_path}")
+        self.queue_upload.emit(normalized_path, monitored_root)
+
     def _handle_monitor_error(self, message: str) -> None:
         """Surface monitoring failures in both the status area and activity log."""
 
         self.window.set_status_message(message, is_error=True)
         self.window.append_activity(f"warning: {message}")
+
+    def _handle_upload_started(self, local_path: str, logical_path: str) -> None:
+        """Surface the start of an iRODS upload in the tray window."""
+
+        self.window.set_status_message(f"Uploading {Path(local_path).name} to iRODS...")
+        self.window.append_activity(f"uploading -> {local_path} to {logical_path}")
+
+    def _handle_upload_progress(
+        self,
+        local_path: str,
+        _logical_path: str,
+        bytes_sent: int,
+        total_bytes: int,
+    ) -> None:
+        """Show coarse-grained upload progress without blocking the UI thread."""
+
+        if total_bytes <= 0:
+            self.window.set_status_message(f"Uploading {Path(local_path).name}...")
+            return
+
+        percent_complete = int((bytes_sent / total_bytes) * 100)
+        self.window.set_status_message(
+            f"Uploading {Path(local_path).name}: {percent_complete}%"
+        )
+
+    def _handle_upload_finished(self, local_path: str, logical_path: str) -> None:
+        """Clear queue tracking and log successful background uploads."""
+
+        self._queued_uploads.discard(local_path)
+        self.window.set_status_message(f"Uploaded {Path(local_path).name} to iRODS.")
+        self.window.append_activity(f"uploaded -> {local_path} to {logical_path}")
+
+    def _handle_upload_failed(self, local_path: str, message: str) -> None:
+        """Clear queue tracking and surface upload failures to the user."""
+
+        self._queued_uploads.discard(local_path)
+        self.window.set_status_message(message, is_error=True)
+        self.window.append_activity(f"upload failed: {local_path} ({message})")
+
+    def _match_monitored_directory(self, path: str) -> str | None:
+        """Return the configured watch root that contains the given file path."""
+
+        candidate = Path(path).expanduser().resolve(strict=False)
+        best_match: str | None = None
+
+        for directory in self.config.monitored_directories:
+            directory_path = Path(directory).expanduser().resolve(strict=False)
+            try:
+                candidate.relative_to(directory_path)
+            except ValueError:
+                continue
+
+            if best_match is None or len(directory) > len(best_match):
+                best_match = directory
+
+        return best_match

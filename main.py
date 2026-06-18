@@ -17,8 +17,8 @@ def main() -> int:
     """
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Directory Ingestion")
-    app.setOrganizationName("OpenCode")
+    app.setApplicationName("Automated Ingest")
+    app.setOrganizationName("iRODS")
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         raise SystemExit("System tray is not available in this environment.")

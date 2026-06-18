@@ -18,6 +18,7 @@ class EventBridge(QObject):
     """
 
     file_event = Signal(str, str, bool)
+    ingest_requested = Signal(str)
     monitor_error = Signal(str)
 
 
@@ -35,6 +36,20 @@ class IngestionEventHandler(FileSystemEventHandler):
 
         self.bridge.file_event.emit(event.event_type, event.src_path, event.is_directory)
 
+    def on_created(self, event: FileSystemEvent) -> None:
+        """Forward created file paths for background ingestion."""
+
+        super().on_created(event)
+        if not event.is_directory:
+            self.bridge.ingest_requested.emit(event.src_path)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        """Forward moved destination paths for background ingestion."""
+
+        super().on_moved(event)
+        if not event.is_directory:
+            self.bridge.ingest_requested.emit(event.dest_path)
+
 
 class MonitorManager(QObject):
     """Own the watchdog observer and keep watched directories in sync with config.
@@ -45,6 +60,7 @@ class MonitorManager(QObject):
     """
 
     file_event = Signal(str, str, bool)
+    ingest_requested = Signal(str)
     monitor_error = Signal(str)
 
     def __init__(self) -> None:
@@ -55,6 +71,7 @@ class MonitorManager(QObject):
         self._bridge = EventBridge()
         self._handler = IngestionEventHandler(self._bridge)
         self._bridge.file_event.connect(self.file_event.emit)
+        self._bridge.ingest_requested.connect(self.ingest_requested.emit)
         self._bridge.monitor_error.connect(self.monitor_error.emit)
         self._watches: dict[str, ObservedWatch] = {}
 
