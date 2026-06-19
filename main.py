@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import signal
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from tray import TrayController
@@ -25,6 +27,13 @@ def main() -> int:
 
     controller = TrayController(app)
     controller.show_window()
+
+    signal.signal(signal.SIGINT, lambda *_args: app.quit())
+
+    interrupt_timer = QTimer()
+    interrupt_timer.timeout.connect(lambda: None)
+    interrupt_timer.start(200)
+
     return app.exec()
 
 

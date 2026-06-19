@@ -17,6 +17,8 @@ class IRODSUploadWorker(QObject):
     upload_progress = Signal(str, str, int, int)
     upload_finished = Signal(str, str)
     upload_failed = Signal(str, str)
+    upload_paths_resolved = Signal(str, str)
+    upload_debug = Signal(str)
 
     def __init__(self, environment_store: IRODSEnvironmentStore) -> None:
         super().__init__()
@@ -29,20 +31,38 @@ class IRODSUploadWorker(QObject):
         local_file = Path(local_path).expanduser().resolve(strict=False)
         monitored_directory = Path(monitored_root).expanduser().resolve(strict=False)
         environment = self._environment_store.load()
+        stage = "initializing upload"
 
         try:
+            self.upload_debug.emit(
+                f"upload debug -> stage={stage} local={local_file} monitored_root={monitored_directory}"
+            )
+            stage = "validating iRODS settings"
             self._validate_environment(environment)
+            self.upload_debug.emit(f"upload debug -> stage={stage}")
+            stage = "waiting for stable file"
             self._wait_for_stable_file(local_file)
             total_bytes = local_file.stat().st_size
+            self.upload_debug.emit(
+                f"upload debug -> stage={stage} size={total_bytes} local={local_file}"
+            )
+            stage = "building logical path"
             logical_path = self._build_logical_path(
                 local_file,
                 monitored_directory,
                 environment,
             )
+            self.upload_debug.emit(
+                f"upload debug -> stage={stage} local={local_file} logical={logical_path}"
+            )
             self.upload_started.emit(str(local_file), logical_path)
+            stage = "streaming upload"
             self._stream_upload(local_file, logical_path, total_bytes, environment)
         except Exception as exc:  # noqa: BLE001
-            self.upload_failed.emit(str(local_file), str(exc))
+            self.upload_failed.emit(
+                str(local_file),
+                f"{stage}: {self._format_exception_message(exc)}",
+            )
             return
 
         self.upload_finished.emit(str(local_file), logical_path)
@@ -108,7 +128,7 @@ class IRODSUploadWorker(QObject):
         total_bytes: int,
         environment: IRODSEnvironment,
     ) -> None:
-        """Authenticate to iRODS and upload the file in chunks for progress updates."""
+        """Authenticate to iRODS and upload to the configured logical path as-is."""
 
         try:
             from irods.session import iRODSSession
@@ -124,40 +144,23 @@ class IRODSUploadWorker(QObject):
             password=environment.irods_password,
             zone=environment.irods_zone_name,
         ) as session:
-            self._ensure_collection(session, str(PurePosixPath(logical_path).parent))
-
-            bytes_sent = 0
-            chunk_size = 1024 * 1024
+            self.upload_debug.emit(
+                f"upload debug -> stage=session ready zone={environment.irods_zone_name}"
+            )
             self.upload_progress.emit(str(local_file), logical_path, 0, total_bytes)
+            self.upload_paths_resolved.emit(str(local_file), logical_path)
+            self.upload_debug.emit(
+                f"upload debug -> stage=before put local={local_file} logical={logical_path}"
+            )
+            print(f"iRODS put: local={local_file} logical={logical_path}", flush=True)
+            session.data_objects.put(str(local_file), logical_path)
+            self.upload_debug.emit("upload debug -> stage=put completed")
+            self.upload_progress.emit(str(local_file), logical_path, total_bytes, total_bytes)
 
-            with local_file.open("rb") as local_stream, session.data_objects.open(
-                logical_path,
-                "w",
-            ) as remote_stream:
-                while True:
-                    chunk = local_stream.read(chunk_size)
-                    if not chunk:
-                        break
-                    remote_stream.write(chunk)
-                    bytes_sent += len(chunk)
-                    self.upload_progress.emit(
-                        str(local_file),
-                        logical_path,
-                        bytes_sent,
-                        total_bytes,
-                    )
+    def _format_exception_message(self, exc: Exception) -> str:
+        """Return a stable error string even when the underlying exception is blank."""
 
-    def _ensure_collection(self, session, logical_collection: str) -> None:
-        """Create missing iRODS collections one path segment at a time."""
-
-        normalized_collection = normalize_irods_collection(logical_collection)
-        current = PurePosixPath("/")
-        for part in PurePosixPath(normalized_collection).parts:
-            if part == "/":
-                continue
-            current = current.joinpath(part)
-            current_path = str(current)
-            try:
-                session.collections.get(current_path)
-            except Exception:  # noqa: BLE001
-                session.collections.create(current_path)
+        details = [str(part).strip() for part in getattr(exc, "args", ()) if str(part).strip()]
+        if details:
+            return ": ".join(details)
+        return exc.__class__.__name__

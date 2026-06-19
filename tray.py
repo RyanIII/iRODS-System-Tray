@@ -38,6 +38,7 @@ class TrayController(QObject):
         self.monitor = MonitorManager()
         self.window = SettingsWindow()
         self._queued_uploads: set[str] = set()
+        self._is_shutting_down = False
 
         self.upload_thread = QThread(self)
         self.upload_worker = IRODSUploadWorker(self.irods_environment_store)
@@ -62,6 +63,7 @@ class TrayController(QObject):
         self._sync_from_config()
         self.window.set_irods_environment(self.irods_environment_store.load())
         self.tray_icon.show()
+        self.app.aboutToQuit.connect(self.shutdown)
 
     def show_window(self) -> None:
         """Show and focus the settings window from the tray or startup path."""
@@ -119,12 +121,22 @@ class TrayController(QObject):
     def exit_application(self) -> None:
         """Save state, stop background monitoring, and quit the Qt application cleanly."""
 
+        self.shutdown()
+        self.app.quit()
+
+    def shutdown(self) -> None:
+        """Stop background services once so any quit path uses the same cleanup."""
+
+        if self._is_shutting_down:
+            return
+
+        self._is_shutting_down = True
         self.config_store.save(self.config)
         self.monitor.shutdown()
         self.upload_thread.quit()
         self.upload_thread.wait(5000)
+        self.window.hide()
         self.tray_icon.hide()
-        self.app.quit()
 
     def save_irods_settings(self) -> None:
         """Persist the iRODS session settings entered in the settings window."""
@@ -180,6 +192,8 @@ class TrayController(QObject):
         self.monitor.monitor_error.connect(self._handle_monitor_error)
         self.queue_upload.connect(self.upload_worker.upload_file)
         self.upload_worker.upload_started.connect(self._handle_upload_started)
+        self.upload_worker.upload_debug.connect(self.window.append_activity)
+        self.upload_worker.upload_paths_resolved.connect(self._handle_upload_paths_resolved)
         self.upload_worker.upload_progress.connect(self._handle_upload_progress)
         self.upload_worker.upload_finished.connect(self._handle_upload_finished)
         self.upload_worker.upload_failed.connect(self._handle_upload_failed)
@@ -287,6 +301,13 @@ class TrayController(QObject):
         percent_complete = int((bytes_sent / total_bytes) * 100)
         self.window.set_status_message(
             f"Uploading {Path(local_path).name}: {percent_complete}%"
+        )
+
+    def _handle_upload_paths_resolved(self, local_path: str, logical_path: str) -> None:
+        """Record the final paths used for the imminent iRODS put operation."""
+
+        self.window.append_activity(
+            f"iRODS put paths -> local={local_path} logical={logical_path}"
         )
 
     def _handle_upload_finished(self, local_path: str, logical_path: str) -> None:
