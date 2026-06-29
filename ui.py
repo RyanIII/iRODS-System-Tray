@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QFrame,
     QFormLayout,
     QHBoxLayout,
@@ -19,7 +20,219 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import IRODSEnvironment
+from config import IRODSEnvironment, default_irods_home_collection
+
+
+class LoginDialog(QDialog):
+    """Gate access to the application until live iRODS authentication succeeds."""
+
+    def __init__(self, environment: IRODSEnvironment) -> None:
+        super().__init__()
+        self._environment = environment
+        self.authenticated_environment: IRODSEnvironment | None = None
+
+        self.setWindowTitle("iRODS Login")
+        self.setModal(True)
+        self.resize(420, 320)
+
+        title_label = QLabel("Sign in to iRODS")
+        title_label.setStyleSheet("font-size: 22px; font-weight: 600;")
+
+        subtitle_label = QLabel(
+            "Enter your iRODS connection details and credentials before accessing "
+            "the ingestion monitor."
+        )
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setStyleSheet("color: #667085;")
+
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText("Enter iRODS host")
+        self.host_input.setText(environment.irods_host)
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("Enter iRODS port")
+        self.port_input.setText(str(environment.irods_port))
+        self.zone_name_input = QLineEdit()
+        self.zone_name_input.setPlaceholderText("Enter iRODS zone")
+        self.zone_name_input.setText(environment.irods_zone_name)
+        self.user_name_input = QLineEdit()
+        self.user_name_input.setPlaceholderText("Enter iRODS username")
+        self.user_name_input.setText(environment.irods_user_name)
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Enter iRODS password")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setText(environment.irods_password)
+        self.password_input.returnPressed.connect(self._attempt_login)
+
+        form_layout.addRow("Host", self.host_input)
+        form_layout.addRow("Port", self.port_input)
+        form_layout.addRow("Zone", self.zone_name_input)
+        form_layout.addRow("Username", self.user_name_input)
+        form_layout.addRow("Password", self.password_input)
+
+        self.status_label = QLabel("Enter your iRODS connection details to continue.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #344054;")
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        self.sign_in_button = QPushButton("Sign In")
+        self.sign_in_button.clicked.connect(self._attempt_login)
+
+        button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.sign_in_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        layout.addLayout(form_layout)
+        layout.addWidget(self.status_label)
+        layout.addLayout(button_row)
+
+        self.setStyleSheet(
+            "QWidget { background: #f8fafc; color: #101828; }"
+            "QLineEdit { border: 1px solid #d0d5dd; border-radius: 10px; padding: 10px; background: white; }"
+            "QPushButton { background: #101828; color: white; border-radius: 10px; padding: 10px 14px; }"
+        )
+
+    def _attempt_login(self) -> None:
+        """Allow access only when the entered credentials authenticate with iRODS."""
+
+        entered_host = self.host_input.text().strip()
+        entered_port_text = self.port_input.text().strip()
+        entered_zone = self.zone_name_input.text().strip()
+        entered_user = self.user_name_input.text().strip()
+        entered_password = self.password_input.text()
+
+        if (
+            not entered_host
+            or not entered_port_text
+            or not entered_zone
+            or not entered_user
+            or not entered_password
+        ):
+            self._set_status_message(
+                "Enter host, port, zone, username, and password.",
+                is_error=True,
+            )
+            return
+
+        try:
+            entered_port = int(entered_port_text)
+        except ValueError:
+            self._set_status_message("Enter a valid numeric port.", is_error=True)
+            return
+
+        if entered_port < 1 or entered_port > 65535:
+            self._set_status_message("Port must be between 1 and 65535.", is_error=True)
+            return
+
+        self.sign_in_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self._set_status_message("Signing in to iRODS...")
+
+        try:
+            self._authenticate_against_irods(
+                entered_host,
+                entered_port,
+                entered_zone,
+                entered_user,
+                entered_password,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.password_input.clear()
+            self._set_status_message(self._format_login_error(exc), is_error=True)
+            return
+        finally:
+            self.sign_in_button.setEnabled(True)
+            self.cancel_button.setEnabled(True)
+
+        self.authenticated_environment = self._build_authenticated_environment(
+            entered_host,
+            entered_port,
+            entered_zone,
+            entered_user,
+            entered_password,
+        )
+        self.accept()
+
+    def _authenticate_against_irods(
+        self,
+        host: str,
+        port: int,
+        zone_name: str,
+        user_name: str,
+        password: str,
+    ) -> None:
+        """Attempt a real iRODS login using only the entered connection fields."""
+
+        try:
+            from irods.session import iRODSSession
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise RuntimeError(
+                "python-irodsclient is not installed. Install it to enable iRODS login."
+            ) from exc
+
+        with iRODSSession(
+            host=host,
+            port=port,
+            user=user_name,
+            password=password,
+            zone=zone_name,
+        ) as session:
+            session.users.get(user_name, zone_name)
+
+    def _build_authenticated_environment(
+        self,
+        host: str,
+        port: int,
+        zone_name: str,
+        user_name: str,
+        password: str,
+    ) -> IRODSEnvironment:
+        """Persist the active user while preserving the existing server configuration."""
+
+        current_home = default_irods_home_collection(
+            self._environment.irods_zone_name,
+            self._environment.irods_user_name,
+        )
+        new_home = default_irods_home_collection(zone_name, user_name)
+
+        default_vault = self._environment.irods_default_vault
+        if not default_vault or default_vault == current_home:
+            default_vault = new_home
+
+        return IRODSEnvironment(
+            irods_host=host,
+            irods_port=port,
+            irods_user_name=user_name,
+            irods_password=password,
+            irods_zone_name=zone_name,
+            irods_default_vault=default_vault,
+        )
+
+    def _format_login_error(self, exc: Exception) -> str:
+        """Convert low-level iRODS errors into stable user-facing feedback."""
+
+        details = [str(part).strip() for part in getattr(exc, "args", ()) if str(part).strip()]
+        if details:
+            return f"Sign-in failed: {': '.join(details)}"
+        return f"Sign-in failed: {exc.__class__.__name__}"
+
+    def _set_status_message(self, message: str, *, is_error: bool = False) -> None:
+        """Render feedback inside the login dialog."""
+
+        color = "#b42318" if is_error else "#344054"
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(f"color: {color};")
 
 
 class SettingsWindow(QWidget):

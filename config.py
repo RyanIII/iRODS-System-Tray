@@ -71,6 +71,14 @@ def normalize_irods_collection(path: str) -> str:
     return normalized.rstrip("/") or "/"
 
 
+def default_irods_home_collection(zone_name: str, user_name: str) -> str:
+    """Build the conventional home collection path for an iRODS user."""
+
+    zone = zone_name.strip().strip("/")
+    user = user_name.strip().strip("/")
+    return normalize_irods_collection(f"/{zone}/home/{user}")
+
+
 class ConfigStore:
     """Load and save the application state as JSON on disk.
 
