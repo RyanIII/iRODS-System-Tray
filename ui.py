@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import socket
+
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -24,10 +26,11 @@ from config import IRODSEnvironment, default_irods_home_collection
 
 
 class LoginWorker(QObject):
-    """Authenticate against iRODS on a background thread for a responsive dialog."""
+    """Authenticate against iRODS on a background thread."""
 
     authentication_finished = Signal(bool, object)
     finished = Signal()
+    CONNECTION_PRECHECK_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -47,6 +50,17 @@ class LoginWorker(QObject):
     @Slot()
     def authenticate(self) -> None:
         """Attempt a real iRODS login without blocking the Qt UI thread."""
+
+        try:
+            with socket.create_connection(
+                (self._host, self._port),
+                timeout=self.CONNECTION_PRECHECK_TIMEOUT_SECONDS,
+            ):
+                pass
+        except OSError as exc:
+            self.authentication_finished.emit(False, exc)
+            self.finished.emit()
+            return
 
         try:
             from irods.session import iRODSSession
@@ -257,7 +271,7 @@ class LoginDialog(QDialog):
                 "cat_invalid_user",
             )
         ):
-            return "Sign-in failed: The iRODS username was not recognized."
+            return "Sign-in failed. Check the username and password."
 
         if any(
             token in lowered_details or token in lowered_type
@@ -270,9 +284,7 @@ class LoginDialog(QDialog):
                 "auth",
             )
         ):
-            return (
-                "Sign-in failed: The username, password, or zone is incorrect."
-            )
+            return "Sign-in failed. Check the username and password."
 
         if any(
             token in lowered_details or token in lowered_type
@@ -287,7 +299,7 @@ class LoginDialog(QDialog):
                 "network",
             )
         ):
-            return "Sign-in failed: Could not reach the iRODS server. Check the host and port."
+            return "Could not connect. Check the host, port, and zone."
 
         if any(
             token in lowered_details or token in lowered_type
@@ -297,7 +309,7 @@ class LoginDialog(QDialog):
                 "certificate",
             )
         ):
-            return "Sign-in failed: The server connection could not be established securely."
+            return "Could not connect. Check the host, port, and zone."
 
         if details:
             return f"Sign-in failed: {detail_text}"
