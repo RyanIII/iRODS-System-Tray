@@ -27,7 +27,7 @@ class IRODSEnvironment:
     irods_host: str = "127.0.0.1"
     irods_port: int = 1247
     irods_user_name: str = "alice"
-    irods_password: str = "alicepass"
+    irods_password: str = ""
     irods_zone_name: str = "tempZone"
     irods_default_vault: str = "/tempZone/home/alice"
 
@@ -145,7 +145,7 @@ class IRODSEnvironmentStore:
         self.save(IRODSEnvironment())
 
     def load(self) -> IRODSEnvironment:
-        """Read iRODS settings from disk and fall back to sane defaults on errors."""
+        """Read non-secret iRODS settings from disk and fall back on errors."""
 
         if not self.path.exists():
             return IRODSEnvironment()
@@ -168,9 +168,7 @@ class IRODSEnvironmentStore:
             irods_user_name=str(
                 payload.get("irods_user_name", default_environment.irods_user_name)
             ).strip(),
-            irods_password=str(
-                payload.get("irods_password", default_environment.irods_password)
-            ),
+            irods_password="",
             irods_zone_name=str(
                 payload.get("irods_zone_name", default_environment.irods_zone_name)
             ).strip(),
@@ -185,9 +183,10 @@ class IRODSEnvironmentStore:
         )
 
     def save(self, environment: IRODSEnvironment) -> None:
-        """Persist iRODS settings in the standard client JSON shape."""
+        """Persist non-secret iRODS settings in the standard client JSON shape."""
 
         payload = asdict(environment)
+        payload.pop("irods_password", None)
         payload["irods_host"] = environment.irods_host.strip()
         payload["irods_port"] = int(environment.irods_port)
         payload["irods_user_name"] = environment.irods_user_name.strip()

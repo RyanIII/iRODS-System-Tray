@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -23,6 +23,60 @@ from PySide6.QtWidgets import (
 from config import IRODSEnvironment, default_irods_home_collection
 
 
+class LoginWorker(QObject):
+    """Authenticate against iRODS on a background thread for a responsive dialog."""
+
+    authentication_finished = Signal(bool, object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        zone_name: str,
+        user_name: str,
+        password: str,
+    ) -> None:
+        super().__init__()
+        self._host = host
+        self._port = port
+        self._zone_name = zone_name
+        self._user_name = user_name
+        self._password = password
+
+    @Slot()
+    def authenticate(self) -> None:
+        """Attempt a real iRODS login without blocking the Qt UI thread."""
+
+        try:
+            from irods.session import iRODSSession
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            self.authentication_finished.emit(
+                False,
+                RuntimeError(
+                    "python-irodsclient is not installed. Install it to enable iRODS login."
+                ),
+            )
+            self.finished.emit()
+            return
+
+        try:
+            with iRODSSession(
+                host=self._host,
+                port=self._port,
+                user=self._user_name,
+                password=self._password,
+                zone=self._zone_name,
+            ) as session:
+                session.users.get(self._user_name, self._zone_name)
+        except Exception as exc:  # noqa: BLE001
+            self.authentication_finished.emit(False, exc)
+        else:
+            self.authentication_finished.emit(True, None)
+        finally:
+            self.finished.emit()
+
+
 class LoginDialog(QDialog):
     """Gate access to the application until live iRODS authentication succeeds."""
 
@@ -30,6 +84,10 @@ class LoginDialog(QDialog):
         super().__init__()
         self._environment = environment
         self.authenticated_environment: IRODSEnvironment | None = None
+        self._auth_thread: QThread | None = None
+        self._auth_worker: LoginWorker | None = None
+        self._pending_login: tuple[str, int, str, str, str] | None = None
+        self._auth_result: tuple[bool, object] | None = None
 
         self.setWindowTitle("iRODS Login")
         self.setModal(True)
@@ -138,57 +196,20 @@ class LoginDialog(QDialog):
         self.sign_in_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
         self._set_status_message("Signing in to iRODS...")
-
-        try:
-            self._authenticate_against_irods(
-                entered_host,
-                entered_port,
-                entered_zone,
-                entered_user,
-                entered_password,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.password_input.clear()
-            self._set_status_message(self._format_login_error(exc), is_error=True)
-            return
-        finally:
-            self.sign_in_button.setEnabled(True)
-            self.cancel_button.setEnabled(True)
-
-        self.authenticated_environment = self._build_authenticated_environment(
+        self._pending_login = (
             entered_host,
             entered_port,
             entered_zone,
             entered_user,
             entered_password,
         )
-        self.accept()
-
-    def _authenticate_against_irods(
-        self,
-        host: str,
-        port: int,
-        zone_name: str,
-        user_name: str,
-        password: str,
-    ) -> None:
-        """Attempt a real iRODS login using only the entered connection fields."""
-
-        try:
-            from irods.session import iRODSSession
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise RuntimeError(
-                "python-irodsclient is not installed. Install it to enable iRODS login."
-            ) from exc
-
-        with iRODSSession(
-            host=host,
-            port=port,
-            user=user_name,
-            password=password,
-            zone=zone_name,
-        ) as session:
-            session.users.get(user_name, zone_name)
+        self._start_authentication(
+            entered_host,
+            entered_port,
+            entered_zone,
+            entered_user,
+            entered_password,
+        )
 
     def _build_authenticated_environment(
         self,
@@ -223,8 +244,63 @@ class LoginDialog(QDialog):
         """Convert low-level iRODS errors into stable user-facing feedback."""
 
         details = [str(part).strip() for part in getattr(exc, "args", ()) if str(part).strip()]
+        detail_text = ": ".join(details)
+        lowered_details = detail_text.lower()
+        lowered_type = exc.__class__.__name__.lower()
+
+        if any(
+            token in lowered_details or token in lowered_type
+            for token in (
+                "invalid user",
+                "unknown user",
+                "user does not exist",
+                "cat_invalid_user",
+            )
+        ):
+            return "Sign-in failed: The iRODS username was not recognized."
+
+        if any(
+            token in lowered_details or token in lowered_type
+            for token in (
+                "invalid authentication",
+                "authentication error",
+                "password",
+                "pam_auth_password",
+                "cat_invalid_authentication",
+                "auth",
+            )
+        ):
+            return (
+                "Sign-in failed: The username, password, or zone is incorrect."
+            )
+
+        if any(
+            token in lowered_details or token in lowered_type
+            for token in (
+                "connection refused",
+                "timed out",
+                "timeout",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "nodename nor servname provided",
+                "failed to resolve",
+                "network",
+            )
+        ):
+            return "Sign-in failed: Could not reach the iRODS server. Check the host and port."
+
+        if any(
+            token in lowered_details or token in lowered_type
+            for token in (
+                "ssl",
+                "tls",
+                "certificate",
+            )
+        ):
+            return "Sign-in failed: The server connection could not be established securely."
+
         if details:
-            return f"Sign-in failed: {': '.join(details)}"
+            return f"Sign-in failed: {detail_text}"
         return f"Sign-in failed: {exc.__class__.__name__}"
 
     def _set_status_message(self, message: str, *, is_error: bool = False) -> None:
@@ -233,6 +309,97 @@ class LoginDialog(QDialog):
         color = "#b42318" if is_error else "#344054"
         self.status_label.setText(message)
         self.status_label.setStyleSheet(f"color: {color};")
+
+    def reject(self) -> None:
+        """Keep the dialog open while a background sign-in attempt is still running."""
+
+        if self._auth_thread is not None:
+            self._set_status_message(
+                "Wait for the current sign-in attempt to finish.",
+                is_error=True,
+            )
+            return
+        super().reject()
+
+    def _start_authentication(
+        self,
+        host: str,
+        port: int,
+        zone_name: str,
+        user_name: str,
+        password: str,
+    ) -> None:
+        """Run iRODS authentication on a worker thread and report the result later."""
+
+        self._set_authentication_in_progress(True)
+        self._auth_result = None
+
+        thread = QThread(self)
+        worker = LoginWorker(host, port, zone_name, user_name, password)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.authenticate)
+        worker.authentication_finished.connect(self._store_authentication_result)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._finalize_authentication_attempt)
+
+        self._auth_thread = thread
+        self._auth_worker = worker
+        thread.start()
+
+    def _set_authentication_in_progress(self, is_authenticating: bool) -> None:
+        """Disable editing while the dialog is waiting on a live sign-in attempt."""
+
+        self.host_input.setEnabled(not is_authenticating)
+        self.port_input.setEnabled(not is_authenticating)
+        self.zone_name_input.setEnabled(not is_authenticating)
+        self.user_name_input.setEnabled(not is_authenticating)
+        self.password_input.setEnabled(not is_authenticating)
+        self.sign_in_button.setEnabled(not is_authenticating)
+        self.cancel_button.setEnabled(not is_authenticating)
+
+    def _store_authentication_result(self, succeeded: bool, result: object) -> None:
+        """Capture the worker outcome until the thread has fully stopped."""
+
+        self._auth_result = (succeeded, result)
+
+    def _finalize_authentication_attempt(self) -> None:
+        """Handle the last auth result only after the worker thread has exited cleanly."""
+
+        self._auth_thread = None
+        self._auth_worker = None
+        self._set_authentication_in_progress(False)
+
+        if self._auth_result is None:
+            self._set_status_message("Sign-in failed: Authentication thread ended unexpectedly.", is_error=True)
+            return
+
+        succeeded, result = self._auth_result
+        self._auth_result = None
+
+        if not succeeded:
+            self._pending_login = None
+            self.password_input.clear()
+            error = result if isinstance(result, Exception) else RuntimeError("Unknown login failure")
+            self._set_status_message(self._format_login_error(error), is_error=True)
+            return
+
+        if self._pending_login is None:
+            self._set_status_message("Sign-in failed: Missing login state.", is_error=True)
+            return
+
+        host, port, zone_name, user_name, password = self._pending_login
+        self._pending_login = None
+        self.authenticated_environment = self._build_authenticated_environment(
+            host,
+            port,
+            zone_name,
+            user_name,
+            password,
+        )
+        self.accept()
 
 
 class SettingsWindow(QWidget):

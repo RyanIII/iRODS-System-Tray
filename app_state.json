@@ -1,4 +1,6 @@
 {
   "is_monitoring_active": true,
-  "monitored_directories": []
+  "monitored_directories": [
+    "/Users/ryannguyen/Documents/resumes"
+  ]
 }

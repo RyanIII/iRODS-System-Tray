@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from config import IRODSEnvironment, IRODSEnvironmentStore, normalize_irods_collection
+from config import IRODSEnvironment, normalize_irods_collection
 
 
 class IRODSUploadWorker(QObject):
@@ -20,17 +20,17 @@ class IRODSUploadWorker(QObject):
     upload_paths_resolved = Signal(str, str)
     upload_debug = Signal(str)
 
-    def __init__(self, environment_store: IRODSEnvironmentStore) -> None:
-        super().__init__()
-        self._environment_store = environment_store
-
-    @Slot(str, str)
-    def upload_file(self, local_path: str, monitored_root: str) -> None:
+    @Slot(str, str, object)
+    def upload_file(
+        self,
+        local_path: str,
+        monitored_root: str,
+        environment: IRODSEnvironment,
+    ) -> None:
         """Upload a created or moved file into the configured iRODS collection."""
 
         local_file = Path(local_path).expanduser().resolve(strict=False)
         monitored_directory = Path(monitored_root).expanduser().resolve(strict=False)
-        environment = self._environment_store.load()
         stage = "initializing upload"
 
         try:
