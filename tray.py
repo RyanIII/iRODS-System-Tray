@@ -248,14 +248,15 @@ class TrayController(QObject):
 
         self.menu.addAction(self.sign_in_action)
         self.menu.addAction(self.sign_out_action)
-        self.menu.addSeparator()
+        self.auth_separator = self.menu.addSeparator()
         open_action = self.menu.addAction("Open Settings")
         open_action.triggered.connect(lambda _checked=False: self.show_window())
         self.open_settings_action = open_action
         self.menu.addAction(self.monitor_toggle_action)
-        self.menu.addSeparator()
+        self.exit_separator = self.menu.addSeparator()
         exit_action = self.menu.addAction("Exit")
         exit_action.triggered.connect(lambda _checked=False: self.exit_application())
+        self.exit_action = exit_action
 
     def _connect_signals(self) -> None:
         """Connect UI and monitor signals so changes flow through one controller."""
@@ -291,13 +292,19 @@ class TrayController(QObject):
         }
 
         self.window.set_monitoring_active(self.config.is_monitoring_active)
-        self.sign_in_action.setEnabled(False)
+        self.sign_in_action.setVisible(False)
+        self.sign_out_action.setVisible(True)
         self.sign_out_action.setEnabled(True)
+        self.auth_separator.setVisible(True)
+        self.open_settings_action.setVisible(True)
         self.open_settings_action.setEnabled(True)
         previous = self.monitor_toggle_action.blockSignals(True)
         self.monitor_toggle_action.setChecked(self.config.is_monitoring_active)
         self.monitor_toggle_action.blockSignals(previous)
+        self.monitor_toggle_action.setVisible(True)
         self.monitor_toggle_action.setEnabled(True)
+        self.exit_separator.setVisible(True)
+        self.exit_action.setVisible(True)
         self.window.set_directories(self.config.monitored_directories, invalid_directories)
 
         if show_status:
@@ -325,10 +332,14 @@ class TrayController(QObject):
         self.monitor.shutdown()
         self.window.hide()
         self.window.set_status_message("Sign in required before using the ingestion monitor.")
+        self.sign_in_action.setVisible(True)
         self.sign_in_action.setEnabled(True)
-        self.sign_out_action.setEnabled(False)
-        self.open_settings_action.setEnabled(False)
-        self.monitor_toggle_action.setEnabled(False)
+        self.sign_out_action.setVisible(False)
+        self.auth_separator.setVisible(False)
+        self.open_settings_action.setVisible(False)
+        self.monitor_toggle_action.setVisible(False)
+        self.exit_separator.setVisible(False)
+        self.exit_action.setVisible(True)
 
     def _complete_login(self, environment: IRODSEnvironment) -> None:
         """Persist the authenticated user and unlock the existing application UI."""
