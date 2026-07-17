@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QCursor, QIcon
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QStyle, QSystemTrayIcon
 
 from config import ConfigStore, IRODSEnvironment, IRODSEnvironmentStore, normalize_directory
@@ -256,7 +256,6 @@ class TrayController(QObject):
         self.menu.addSeparator()
         exit_action = self.menu.addAction("Exit")
         exit_action.triggered.connect(lambda _checked=False: self.exit_application())
-        self.tray_icon.setContextMenu(self.menu)
 
     def _connect_signals(self) -> None:
         """Connect UI and monitor signals so changes flow through one controller."""
@@ -352,6 +351,8 @@ class TrayController(QObject):
 
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._single_click_timer.start(self.app.doubleClickInterval())
+        elif reason == QSystemTrayIcon.ActivationReason.Context:
+            self.menu.popup(QCursor.pos())
         elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._single_click_timer.stop()
             self.toggle_window()
