@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QCursor, QIcon
+from PySide6.QtCore import QObject, QRectF, QThread, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QCursor, QIcon, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QStyle, QSystemTrayIcon
+
+LOGO_PATH = Path(__file__).resolve().with_name("irods_logo.svg")
 
 from config import ConfigStore, IRODSEnvironment, IRODSEnvironmentStore, normalize_directory
 from irods_worker import IRODSUploadWorker
@@ -59,8 +62,10 @@ class TrayController(QObject):
         self.monitor_toggle_action.toggled.connect(self.set_monitoring_active)
         self.menu = QMenu()
 
-        self.tray_icon = QSystemTrayIcon(self._build_icon(), self)
+        tray_icon = QIcon(self._build_icon())
+        self.tray_icon = QSystemTrayIcon(tray_icon, self)
         self.tray_icon.setToolTip("Directory Ingestion")
+        self.window.setWindowIcon(tray_icon)
         self.tray_icon.activated.connect(self._handle_tray_activation)
 
         self._single_click_timer = QTimer(self)
@@ -233,15 +238,27 @@ class TrayController(QObject):
         self._apply_locked_state()
         self.prompt_login(show_window_on_success=True)
 
-    def _build_icon(self):
-        """Return the bundled tray icon when available, otherwise a standard fallback."""
+    def _build_icon(self) -> QPixmap:
+        """Rasterize the bundled SVG logo for use by the tray and settings window."""
 
-        icon_path = Path(__file__).resolve().with_name("iRODSlogo.png")
-        if icon_path.is_file():
-            icon = QIcon(str(icon_path))
-            if not icon.isNull():
-                return icon
-        return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        if not LOGO_PATH.is_file():
+            return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon).pixmap(32, 32)
+
+        renderer = QSvgRenderer(str(LOGO_PATH))
+        if not renderer.isValid():
+            return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon).pixmap(32, 32)
+
+        size = renderer.defaultSize().scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio)
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(
+            painter,
+            QRectF((32 - size.width()) / 2, (32 - size.height()) / 2, size.width(), size.height()),
+        )
+        painter.end()
+        return pixmap
 
     def _build_menu(self) -> None:
         """Create the tray context menu and wire actions to controller methods."""
