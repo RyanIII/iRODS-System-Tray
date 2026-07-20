@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+import socket
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from config import IRODSEnvironment, MonitoredDirectory, normalize_irods_zone_name
 
+logger = logging.getLogger(__name__)
 
 def _set_label_error_state(label: QLabel, is_error: bool) -> None:
     """Toggle QSS 'error' property so theme.qss.template can recolor the label."""
@@ -33,6 +37,468 @@ def _set_label_error_state(label: QLabel, is_error: bool) -> None:
     label.setProperty("error", is_error)
     label.style().unpolish(label)
     label.style().polish(label)
+    
+
+class LoginWorker(QObject):
+    """Authenticate against iRODS on a background thread."""
+
+    authentication_finished = Signal(bool, object)
+    finished = Signal()
+    CONNECTION_PRECHECK_TIMEOUT_SECONDS = 5.0
+    HEARTBEAT_MESSAGE = (
+        b"\x00\x00\x00\x33<MsgHeader_PI><type>HEARTBEAT</type></MsgHeader_PI>"
+    )
+    HEARTBEAT_RESPONSE = b"HEARTBEAT"
+    HEARTBEAT_RESPONSE_BYTES = 256
+
+    def __init__(self, environment: IRODSEnvironment) -> None:
+        super().__init__()
+        self._environment = environment
+
+    @Slot()
+    def authenticate(self) -> None:
+        """Attempt a real iRODS login without blocking the Qt UI thread."""
+
+        try:
+            from irods.session import iRODSSession
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            self.authentication_finished.emit(
+                False,
+                RuntimeError(
+                    "python-irodsclient is not installed. Install it to enable iRODS login."
+                ),
+            )
+            self.finished.emit()
+            return
+
+        try:
+            self._probe_server_heartbeat()
+        except (OSError, RuntimeError) as exc:
+            self.authentication_finished.emit(False, exc)
+            self.finished.emit()
+            return
+
+        try:
+            with iRODSSession(
+                host=self._environment.irods_host,
+                port=self._environment.irods_port,
+                user=self._environment.irods_user_name,
+                password=self._environment.irods_password,
+                zone=self._environment.irods_zone_name,
+            ) as session:
+                session.users.get(
+                    self._environment.irods_user_name,
+                    self._environment.irods_zone_name,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.authentication_finished.emit(False, exc)
+        else:
+            self.authentication_finished.emit(True, None)
+        finally:
+            self.finished.emit()
+
+    def _probe_server_heartbeat(self) -> None:
+        """Fail fast unless the configured endpoint responds like an iRODS server."""
+
+        address = (self._environment.irods_host, self._environment.irods_port)
+        try:
+            with socket.create_connection(
+                address,
+                timeout=self.CONNECTION_PRECHECK_TIMEOUT_SECONDS,
+            ) as connection:
+                connection.settimeout(self.CONNECTION_PRECHECK_TIMEOUT_SECONDS)
+                connection.sendall(self.HEARTBEAT_MESSAGE)
+                response = connection.recv(self.HEARTBEAT_RESPONSE_BYTES)
+        except OSError as exc:
+            raise OSError(
+                "Could not reach iRODS server at "
+                f"{self._environment.irods_host}:{self._environment.irods_port}"
+            ) from exc
+
+        if response != self.HEARTBEAT_RESPONSE:
+            raise RuntimeError(
+                "Heartbeat probe failed for iRODS server at "
+                f"{self._environment.irods_host}:{self._environment.irods_port}"
+            )
+
+
+class LoginDialog(QDialog):
+    """Gate access to the application until live iRODS authentication succeeds."""
+
+    def __init__(self, environment: IRODSEnvironment) -> None:
+        super().__init__()
+        self._environment = environment
+        self.authenticated_environment: IRODSEnvironment | None = None
+        self._auth_thread: QThread | None = None
+        self._auth_worker: LoginWorker | None = None
+        self._pending_login: tuple[str, int, str, str, str] | None = None
+        self._auth_result: tuple[bool, object] | None = None
+        self._last_login_error_details: str | None = None
+        self._default_dialog_width = 420
+        self._default_dialog_height = 320
+
+        self.setWindowTitle("iRODS Login")
+        self.setModal(True)
+        self.resize(self._default_dialog_width, self._default_dialog_height)
+
+        title_label = QLabel("Sign in to iRODS")
+        title_label.setStyleSheet("font-size: 22px; font-weight: 600;")
+
+        subtitle_label = QLabel(
+            "Enter your iRODS connection details and credentials before accessing "
+            "the ingestion monitor."
+        )
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setStyleSheet("color: #667085;")
+
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText("Enter iRODS host")
+        self.host_input.setText(environment.irods_host)
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("Enter iRODS port")
+        self.port_input.setText(str(environment.irods_port))
+        self.zone_name_input = QLineEdit()
+        self.zone_name_input.setPlaceholderText("Enter iRODS zone")
+        self.zone_name_input.setText(environment.irods_zone_name)
+        self.user_name_input = QLineEdit()
+        self.user_name_input.setPlaceholderText("Enter iRODS username")
+        self.user_name_input.setText(environment.irods_user_name)
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Enter iRODS password")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.returnPressed.connect(self._attempt_login)
+
+        form_layout.addRow("Host", self.host_input)
+        form_layout.addRow("Port", self.port_input)
+        form_layout.addRow("Zone", self.zone_name_input)
+        form_layout.addRow("Username", self.user_name_input)
+        form_layout.addRow("Password", self.password_input)
+
+        self.status_label = QLabel("Enter your iRODS connection details to continue.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #344054;")
+
+        self.error_details_link = QLabel(
+            '<a href="toggle" style="color: #667085; text-decoration: underline;">Show details</a>'
+        )
+        self.error_details_link.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        self.error_details_link.setOpenExternalLinks(False)
+        self.error_details_link.linkActivated.connect(self._toggle_login_error_details)
+        self.error_details_link.hide()
+
+        self.error_details_view = QPlainTextEdit()
+        self.error_details_view.setReadOnly(True)
+        self.error_details_view.setMaximumHeight(85)
+        self.error_details_view.hide()
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        self.sign_in_button = QPushButton("Sign In")
+        self.sign_in_button.clicked.connect(self._attempt_login)
+
+        button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.sign_in_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        layout.addLayout(form_layout)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.error_details_link)
+        layout.addWidget(self.error_details_view)
+        layout.addLayout(button_row)
+
+        self.setStyleSheet(
+            "QWidget { background: #f8fafc; color: #101828; }"
+            "QLineEdit { border: 1px solid #d0d5dd; border-radius: 10px; padding: 10px; background: white; }"
+            "QPlainTextEdit { border: 1px solid #d0d5dd; border-radius: 10px; padding: 10px; background: white; }"
+            "QLabel { color: #101828; }"
+            "QLabel[role='details-link'] { color: #667085; }"
+            "QPushButton { background: #101828; color: white; border-radius: 10px; padding: 10px 14px; }"
+        )
+        self.error_details_link.setProperty("role", "details-link")
+        self.style().unpolish(self.error_details_link)
+        self.style().polish(self.error_details_link)
+
+    def _attempt_login(self) -> None:
+        """Allow access only when the entered credentials authenticate with iRODS."""
+
+        self._set_login_error_details(None)
+        entered_host = self.host_input.text().strip()
+        entered_port_text = self.port_input.text().strip()
+        entered_zone = self.zone_name_input.text().strip()
+        entered_user = self.user_name_input.text().strip()
+        entered_password = self.password_input.text()
+
+        if (
+            not entered_host
+            or not entered_port_text
+            or not entered_zone
+            or not entered_user
+            or not entered_password
+        ):
+            self._set_status_message(
+                "Enter host, port, zone, username, and password.",
+                is_error=True,
+            )
+            return
+
+        try:
+            entered_port = int(entered_port_text)
+        except ValueError:
+            self._set_status_message("Enter a valid numeric port.", is_error=True)
+            return
+
+        if entered_port < 1 or entered_port > 65535:
+            self._set_status_message("Port must be between 1 and 65535.", is_error=True)
+            return
+
+        self.sign_in_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self._set_status_message("Signing in to iRODS...")
+        self._pending_login = (
+            entered_host,
+            entered_port,
+            entered_zone,
+            entered_user,
+            entered_password,
+        )
+        self._start_authentication(
+            IRODSEnvironment(
+                irods_host=entered_host,
+                irods_port=entered_port,
+                irods_user_name=entered_user,
+                irods_password=entered_password,
+                irods_zone_name=entered_zone,
+            )
+        )
+
+    def _format_login_error(self, exc: Exception) -> str:
+        """Convert low-level iRODS errors into stable user-facing feedback."""
+
+        detail_text = self._extract_login_error_details(exc)
+        lowered_details = detail_text.lower()
+        lowered_type = exc.__class__.__name__.lower()
+
+        if any(
+            token in lowered_details or token in lowered_type
+            for token in (
+                "invalid user",
+                "unknown user",
+                "user does not exist",
+                "cat_invalid_user",
+                "invalid authentication",
+                "authentication error",
+                "password",
+                "pam_auth_password",
+                "cat_invalid_authentication",
+                "auth",
+            )
+        ):
+            return "Sign-in failed. Check the username and password."
+
+        if any(
+            token in lowered_details or token in lowered_type
+            for token in (
+                "could not reach irods server",
+                "heartbeat",
+                "connection refused",
+                "timed out",
+                "timeout",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "nodename nor servname provided",
+                "failed to resolve",
+                "network",
+                "ssl",
+                "tls",
+                "certificate",
+            )
+        ):
+            return "Could not connect. Check the host, port, and zone."
+
+        return f"Sign-in failed: {detail_text}"
+
+    def _extract_login_error_details(self, exc: Exception) -> str:
+        """Return raw login error text for logs and on-demand display."""
+
+        rendered = str(exc).strip()
+        if rendered:
+            if rendered == "None":
+                return f"{exc.__class__.__name__}: None"
+            return rendered
+
+        details = [str(part).strip() for part in getattr(exc, "args", ()) if str(part).strip()]
+        if details:
+            detail_text = ": ".join(details)
+            if detail_text == "None":
+                return f"{exc.__class__.__name__}: None"
+            return detail_text
+        return exc.__class__.__name__
+
+    def _set_login_error_details(self, details: str | None) -> None:
+        """Show or clear the low-level login error affordance."""
+
+        self._last_login_error_details = details.strip() if details and details.strip() else None
+        if self._last_login_error_details is None:
+            self.error_details_link.hide()
+            self.error_details_link.setText(
+                '<a href="toggle" style="color: #667085; text-decoration: underline;">Show details</a>'
+            )
+            self.error_details_view.clear()
+            self.error_details_view.hide()
+            self._resize_for_login_error_details()
+            return
+
+        self.error_details_link.setText(
+            '<a href="toggle" style="color: #667085; text-decoration: underline;">Show details</a>'
+        )
+        self.error_details_view.setPlainText(self._last_login_error_details)
+        self.error_details_view.hide()
+        self.error_details_link.show()
+        self._resize_for_login_error_details()
+
+    def _toggle_login_error_details(self, _link: str) -> None:
+        """Expand or collapse the raw login error details panel."""
+
+        is_visible = self.error_details_view.isVisible()
+        self.error_details_view.setVisible(not is_visible)
+        link_label = "Hide details" if not is_visible else "Show details"
+        self.error_details_link.setText(
+            f'<a href="toggle" style="color: #667085; text-decoration: underline;">{link_label}</a>'
+        )
+        self._resize_for_login_error_details()
+
+    def _resize_for_login_error_details(self) -> None:
+        """Resize the dialog to fit the current details visibility without crowding the form."""
+
+        layout = self.layout()
+        if layout is None:
+            return
+
+        layout.activate()
+        target_size = self.sizeHint()
+        target_width = max(self.width(), self._default_dialog_width, target_size.width())
+        if self.error_details_view.isVisible():
+            target_height = max(self.height(), target_size.height())
+        else:
+            target_height = max(self._default_dialog_height, target_size.height())
+        self.resize(target_width, target_height)
+
+    def _set_status_message(self, message: str, *, is_error: bool = False) -> None:
+        """Render feedback inside the login dialog."""
+
+        color = "#b42318" if is_error else "#344054"
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(f"color: {color};")
+
+    def reject(self) -> None:
+        """Keep the dialog open while a background sign-in attempt is still running."""
+
+        if self._auth_thread is not None:
+            self._set_status_message(
+                "Wait for the current sign-in attempt to finish.",
+                is_error=True,
+            )
+            return
+        super().reject()
+
+    def _start_authentication(self, environment: IRODSEnvironment) -> None:
+        """Run iRODS authentication on a worker thread and report the result later."""
+
+        self._set_authentication_in_progress(True)
+        self._auth_result = None
+
+        thread = QThread(self)
+        worker = LoginWorker(environment)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.authenticate)
+        worker.authentication_finished.connect(self._store_authentication_result)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._finalize_authentication_attempt)
+
+        self._auth_thread = thread
+        self._auth_worker = worker
+        thread.start()
+
+    def _set_authentication_in_progress(self, is_authenticating: bool) -> None:
+        """Disable editing while the dialog is waiting on a live sign-in attempt."""
+
+        self.host_input.setEnabled(not is_authenticating)
+        self.port_input.setEnabled(not is_authenticating)
+        self.zone_name_input.setEnabled(not is_authenticating)
+        self.user_name_input.setEnabled(not is_authenticating)
+        self.password_input.setEnabled(not is_authenticating)
+        self.sign_in_button.setEnabled(not is_authenticating)
+        self.cancel_button.setEnabled(not is_authenticating)
+
+    def _store_authentication_result(self, succeeded: bool, result: object) -> None:
+        """Capture the worker outcome until the thread has fully stopped."""
+
+        self._auth_result = (succeeded, result)
+
+    def _finalize_authentication_attempt(self) -> None:
+        """Handle the last auth result only after the worker thread has exited cleanly."""
+
+        self._auth_thread = None
+        self._auth_worker = None
+        self._set_authentication_in_progress(False)
+
+        if self._auth_result is None:
+            self._set_login_error_details(None)
+            self._set_status_message(
+                "Sign-in failed: Authentication thread ended unexpectedly.",
+                is_error=True,
+            )
+            return
+
+        succeeded, result = self._auth_result
+        self._auth_result = None
+
+        if not succeeded:
+            self._pending_login = None
+            self.password_input.clear()
+            error = result if isinstance(result, Exception) else RuntimeError("Unknown login failure")
+            logger.error(
+                "iRODS login failed: %s",
+                self._extract_login_error_details(error),
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            self._set_login_error_details(self._extract_login_error_details(error))
+            self._set_status_message(self._format_login_error(error), is_error=True)
+            return
+
+        if self._pending_login is None:
+            self._set_login_error_details(None)
+            self._set_status_message("Sign-in failed: Missing login state.", is_error=True)
+            return
+
+        host, port, zone_name, user_name, password = self._pending_login
+        self._pending_login = None
+        self._set_login_error_details(None)
+        self.authenticated_environment = IRODSEnvironment(
+            irods_host=host,
+            irods_port=port,
+            irods_user_name=user_name,
+            irods_password=password,
+            irods_zone_name=zone_name,
+        )
+        self.accept()
 
 
 class ZoneRootLineEdit(QLineEdit):
@@ -382,7 +848,7 @@ class SettingsWindow(QWidget):
         self.irods_host_input.setText(environment.irods_host)
         self.irods_port_input.setValue(environment.irods_port)
         self.irods_user_name_input.setText(environment.irods_user_name)
-        self.irods_password_input.setText(environment.irods_password)
+        self.irods_password_input.clear()
         self.irods_zone_name_input.setText(environment.irods_zone_name)
         self._irods_zone_for_new_folders = environment.irods_zone_name
 
