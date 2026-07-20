@@ -8,7 +8,7 @@ from threading import Lock
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from config import IRODSEnvironment, IRODSEnvironmentStore, normalize_irods_collection
+from config import IRODSEnvironment, normalize_irods_collection
 
 
 class IRODSUploadWorker(QObject):
@@ -22,11 +22,25 @@ class IRODSUploadWorker(QObject):
     upload_paths_resolved = Signal(str, str)
     upload_debug = Signal(str)
 
-    def __init__(self, environment_store: IRODSEnvironmentStore) -> None:
+    def __init__(self, environment: IRODSEnvironment | None = None) -> None:
         super().__init__()
-        self._environment_store = environment_store
+        self._environment = self._copy_environment(environment or IRODSEnvironment())
         self._cancelled_monitored_roots: set[str] = set()
         self._cancelled_monitored_roots_lock = Lock()
+
+    @Slot(object)
+    def set_environment(self, environment: object) -> None:
+        """Replace the upload credentials with the latest authenticated snapshot."""
+
+        if not isinstance(environment, IRODSEnvironment):
+            raise TypeError("Expected an IRODSEnvironment instance.")
+        self._environment = self._copy_environment(environment)
+
+    @Slot()
+    def clear_environment(self) -> None:
+        """Drop any in-memory credentials when the user signs out."""
+
+        self._environment = IRODSEnvironment()
 
     def cancel_directory_uploads(self, monitored_root: str) -> None:
         """Prevent any later queued uploads for an unavailable monitored folder."""
@@ -54,7 +68,7 @@ class IRODSUploadWorker(QObject):
         local_file = Path(local_path).expanduser().resolve(strict=False)
         monitored_directory = Path(monitored_root).expanduser().resolve(strict=False)
         normalized_monitored_root = str(monitored_directory)
-        environment = self._environment_store.load()
+        environment = self._copy_environment(self._environment)
         stage = "initializing upload"
 
         if self._is_cancelled(normalized_monitored_root):
@@ -233,3 +247,14 @@ class IRODSUploadWorker(QObject):
 
         with self._cancelled_monitored_roots_lock:
             return monitored_root in self._cancelled_monitored_roots
+
+    def _copy_environment(self, environment: IRODSEnvironment) -> IRODSEnvironment:
+        """Clone environments so updates do not race with in-flight uploads."""
+
+        return IRODSEnvironment(
+            irods_host=environment.irods_host,
+            irods_port=environment.irods_port,
+            irods_user_name=environment.irods_user_name,
+            irods_password=environment.irods_password,
+            irods_zone_name=environment.irods_zone_name,
+        )
