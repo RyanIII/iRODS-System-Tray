@@ -20,6 +20,17 @@ class AppConfig:
 
     is_monitoring_active: bool = True
     monitored_directories: list[MonitoredDirectory] = field(default_factory=list)
+    retry: RetryConfig = field(default_factory=lambda: RetryConfig())
+    retry_by_user: dict[str, RetryConfig] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RetryConfig:
+    """Store retry behavior for failed uploads."""
+
+    attempts: int = 1
+    first_delay_in_seconds: int = 1
+    backoff_multiplier: float = 1.0
 
 
 @dataclass(slots=True)
@@ -42,6 +53,15 @@ class IRODSEnvironment:
     irods_user_name: str = ""
     irods_password: str = ""
     irods_zone_name: str = "tempZone"
+
+
+def build_retry_settings_user_key(environment: IRODSEnvironment) -> str:
+    """Return a stable per-user key for retry settings persistence."""
+
+    host = environment.irods_host.strip()
+    user_name = environment.irods_user_name.strip()
+    zone_name = normalize_irods_zone_name(environment.irods_zone_name)
+    return f"{user_name}@{host}:{int(environment.irods_port)}/{zone_name}"
 
 
 def normalize_directory(path: str) -> str:
@@ -88,6 +108,60 @@ def normalize_monitored_directories(
         seen.add(normalized.source_directory)
         unique_directories.append(normalized)
     return unique_directories
+
+
+def normalize_retry_config(retry: RetryConfig | dict[str, object] | None) -> RetryConfig:
+    """Return a bounded retry config from supported persisted shapes."""
+
+    defaults = RetryConfig()
+    if isinstance(retry, RetryConfig):
+        attempts = retry.attempts
+        first_delay_in_seconds = retry.first_delay_in_seconds
+        backoff_multiplier = retry.backoff_multiplier
+    elif isinstance(retry, dict):
+        attempts = retry.get("attempts", defaults.attempts)
+        first_delay_in_seconds = retry.get(
+            "first_delay_in_seconds", defaults.first_delay_in_seconds
+        )
+        backoff_multiplier = retry.get("backoff_multiplier", defaults.backoff_multiplier)
+    else:
+        return defaults
+
+    try:
+        normalized_attempts = max(0, int(attempts))
+    except (TypeError, ValueError):
+        normalized_attempts = defaults.attempts
+
+    try:
+        normalized_first_delay = max(0, int(first_delay_in_seconds))
+    except (TypeError, ValueError):
+        normalized_first_delay = defaults.first_delay_in_seconds
+
+    try:
+        normalized_backoff = max(1.0, float(backoff_multiplier))
+    except (TypeError, ValueError):
+        normalized_backoff = defaults.backoff_multiplier
+
+    return RetryConfig(
+        attempts=normalized_attempts,
+        first_delay_in_seconds=normalized_first_delay,
+        backoff_multiplier=normalized_backoff,
+    )
+
+
+def normalize_retry_map(retry_by_user: object) -> dict[str, RetryConfig]:
+    """Normalize persisted per-user retry settings and discard malformed entries."""
+
+    if not isinstance(retry_by_user, dict):
+        return {}
+
+    normalized: dict[str, RetryConfig] = {}
+    for raw_user_key, raw_retry in retry_by_user.items():
+        user_key = str(raw_user_key).strip()
+        if not user_key:
+            continue
+        normalized[user_key] = normalize_retry_config(raw_retry)
+    return normalized
 
 
 def _normalize_monitored_directory(
@@ -220,6 +294,8 @@ class ConfigStore:
         return AppConfig(
             is_monitoring_active=bool(payload.get("is_monitoring_active", True)),
             monitored_directories=normalize_monitored_directories(directories),
+            retry=normalize_retry_config(payload.get("retry")),
+            retry_by_user=normalize_retry_map(payload.get("retry_by_user")),
         )
 
     def save(self, config: AppConfig) -> None:
@@ -229,6 +305,8 @@ class ConfigStore:
         an interrupted write is less likely to leave behind a partially written config.
         """
 
+        normalized_retry = normalize_retry_config(config.retry)
+        normalized_retry_by_user = normalize_retry_map(config.retry_by_user)
         payload = {
             "is_monitoring_active": bool(config.is_monitoring_active),
             "monitored_directories": [
@@ -241,6 +319,19 @@ class ConfigStore:
                 }
                 for directory in normalize_monitored_directories(config.monitored_directories)
             ],
+            "retry": {
+                "attempts": normalized_retry.attempts,
+                "first_delay_in_seconds": normalized_retry.first_delay_in_seconds,
+                "backoff_multiplier": normalized_retry.backoff_multiplier,
+            },
+            "retry_by_user": {
+                user_key: {
+                    "attempts": retry.attempts,
+                    "first_delay_in_seconds": retry.first_delay_in_seconds,
+                    "backoff_multiplier": retry.backoff_multiplier,
+                }
+                for user_key, retry in normalized_retry_by_user.items()
+            },
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self.path.with_suffix(".tmp")

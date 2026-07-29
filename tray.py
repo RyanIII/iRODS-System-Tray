@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Thread
 
-from PySide6.QtCore import QObject, QRectF, Qt, Signal, QThread
+from PySide6.QtCore import QObject, QRectF, Qt, Signal, QThread, QTimer
 from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QStyle
@@ -17,7 +18,9 @@ from config import (
     IRODSEnvironment,
     IRODSEnvironmentStore,
     MonitoredDirectory,
+    build_retry_settings_user_key,
     normalize_directory,
+    normalize_retry_config,
     normalize_irods_zone_name,
     normalize_monitored_directories,
     normalize_post_upload_action,
@@ -28,6 +31,23 @@ from config import (
 from irods_worker import IRODSUploadWorker
 from monitor import MonitorManager
 from ui import LoginDialog, SettingsWindow
+
+
+@dataclass(slots=True)
+class UploadJob:
+    """Track the controller-side state for one queued or active upload."""
+
+    local_path: str
+    monitored_root: str
+    target_collection: str
+    post_upload_action: str = "delete"
+    post_upload_destination: str = ""
+    attempt_number: int = 1
+    max_attempts: int = 1
+    logical_path: str = ""
+    last_error: str = ""
+    status: str = "queued"
+    retry_timer: QTimer | None = field(default=None, repr=False, compare=False)
 
 
 class TrayController(QObject):
@@ -57,7 +77,8 @@ class TrayController(QObject):
         self.environment = self.irods_environment_store.load()
         self.monitor = MonitorManager()
         self.window = SettingsWindow()
-        self._queued_uploads: dict[str, str] = {}
+        self._queued_uploads: dict[str, UploadJob] = {}
+        self._failed_uploads: dict[str, UploadJob] = {}
         self._is_shutting_down = False
         self._login_dialog: LoginDialog | None = None
         self._show_window_after_login = False
@@ -89,7 +110,9 @@ class TrayController(QObject):
         self._build_menu()
         self.tray_icon.setContextMenu(self.menu)
         self._connect_signals()
+        self.config.retry = normalize_retry_config(None)
         self.window.set_irods_environment(self.environment)
+        self.window.set_retry_config(self.config.retry)
         if self._is_authenticated:
             self._sync_from_config()
         else:
@@ -252,6 +275,8 @@ class TrayController(QObject):
         """Apply the global monitoring toggle from either the tray or the window."""
 
         self.config.is_monitoring_active = is_active
+        if not is_active:
+            self._pause_pending_retries()
         self._persist_and_sync()
 
     def exit_application(self) -> None:
@@ -269,6 +294,7 @@ class TrayController(QObject):
         self._is_shutting_down = True
         self.config_store.save(self.config)
         self.monitor.shutdown()
+        self._clear_upload_jobs()
         self.upload_thread.quit()
         self.upload_thread.wait(5000)
         self.window.hide()
@@ -276,6 +302,39 @@ class TrayController(QObject):
 
     def save_irods_settings(self) -> None:
         """Persist the iRODS session settings entered in the settings window."""
+
+        environment = self._window_environment_for_save()
+        if environment is None:
+            return
+
+        self._apply_irods_settings(environment, sync_retry_from_user=True)
+
+    def save_settings(self) -> None:
+        """Persist the iRODS and retry settings entered in the settings window."""
+
+        environment = self._window_environment_for_save()
+        if environment is None:
+            return
+
+        retry_config = normalize_retry_config(self.window.get_retry_config())
+        zone_changed = self._apply_irods_settings(
+            environment,
+            sync_retry_from_user=False,
+            show_feedback=False,
+        )
+        self._persist_retry_settings(retry_config, show_feedback=False)
+        self.window.set_retry_config(self.config.retry)
+        self.window.set_status_message("Saved settings.")
+        self.window.append_activity(
+            f"saved settings for {environment.irods_user_name} at {environment.irods_host}:{environment.irods_port}"
+        )
+        if zone_changed:
+            self.window.append_activity(
+                f"updated monitored folder targets to use /{normalize_irods_zone_name(environment.irods_zone_name)}"
+            )
+
+    def _window_environment_for_save(self) -> IRODSEnvironment | None:
+        """Return validated iRODS settings from the form or report the missing fields."""
 
         environment = self.window.get_irods_environment()
         if not environment.irods_password:
@@ -297,7 +356,18 @@ class TrayController(QObject):
                 "Complete host, user, and zone before saving.",
                 is_error=True,
             )
-            return
+            return None
+
+        return environment
+
+    def _apply_irods_settings(
+        self,
+        environment: IRODSEnvironment,
+        *,
+        sync_retry_from_user: bool,
+        show_feedback: bool = True,
+    ) -> bool:
+        """Apply validated iRODS settings and optionally refresh retry values."""
 
         old_zone_name = self.environment.irods_zone_name
         new_zone_name = environment.irods_zone_name
@@ -307,20 +377,53 @@ class TrayController(QObject):
         if zone_changed:
             self._rezone_directory_targets(old_zone_name, new_zone_name)
 
+        if sync_retry_from_user:
+            self.config.retry = self._retry_config_for_environment(environment)
         self.irods_environment_store.save(self._without_password(environment))
         self.environment = environment
         self.upload_environment_updated.emit(environment)
         self.window.set_irods_environment(self.environment)
+        if sync_retry_from_user:
+            self.window.set_retry_config(self.config.retry)
         if zone_changed:
             self.config_store.save(self.config)
             self._sync_from_config(show_status=False)
-        self.window.set_status_message("Saved iRODS settings.")
-        self.window.append_activity(
-            f"saved iRODS settings for {environment.irods_user_name} at {environment.irods_host}:{environment.irods_port}"
-        )
-        if zone_changed:
+        if show_feedback:
+            self.window.set_status_message("Saved iRODS settings.")
             self.window.append_activity(
-                f"updated monitored folder targets to use /{normalize_irods_zone_name(new_zone_name)}"
+                f"saved iRODS settings for {environment.irods_user_name} at {environment.irods_host}:{environment.irods_port}"
+            )
+            if zone_changed:
+                self.window.append_activity(
+                    f"updated monitored folder targets to use /{normalize_irods_zone_name(new_zone_name)}"
+                )
+        return zone_changed
+
+    def save_retry_settings(self) -> None:
+        """Persist the retry settings entered in the settings window."""
+
+        self._persist_retry_settings(normalize_retry_config(self.window.get_retry_config()))
+
+    def _persist_retry_settings(
+        self,
+        retry_config,
+        *,
+        show_feedback: bool = True,
+    ) -> None:
+        """Persist retry settings for the current authenticated user."""
+
+        self.config.retry = retry_config
+        user_key = build_retry_settings_user_key(self.environment)
+        self.config.retry_by_user[user_key] = self.config.retry
+        self.config_store.save(self.config)
+        self.window.set_retry_config(self.config.retry)
+        if show_feedback:
+            self.window.set_status_message("Saved retry settings.")
+            self.window.append_activity(
+                "saved retry settings "
+                f"(attempts={self.config.retry.attempts}, "
+                f"first_delay={self.config.retry.first_delay_in_seconds}s, "
+                f"backoff={self.config.retry.backoff_multiplier})"
             )
 
     def sign_out(self) -> None:
@@ -330,7 +433,7 @@ class TrayController(QObject):
             return
 
         self._is_authenticated = False
-        self._queued_uploads.clear()
+        self._clear_upload_jobs()
         self.upload_environment_cleared.emit()
         self.environment = self.irods_environment_store.load()
         self.window.set_irods_environment(self.environment)
@@ -374,7 +477,8 @@ class TrayController(QObject):
 
         self.window.add_folder_requested.connect(self.add_directory)
         self.window.remove_folder_requested.connect(self.remove_directory)
-        self.window.save_irods_requested.connect(self.save_irods_settings)
+        self.window.retry_failed_upload_requested.connect(self.retry_failed_upload)
+        self.window.save_settings_requested.connect(self.save_settings)
         self.window.monitoring_toggled.connect(self.set_monitoring_active)
         self.notification_open_requested.connect(self.show_window)
         self.monitor.file_event.connect(self._handle_file_event)
@@ -438,6 +542,7 @@ class TrayController(QObject):
         self.exit_separator.setVisible(True)
         self.exit_action.setVisible(True)
         self.window.set_directories(self.config.monitored_directories, invalid_directories)
+        self._refresh_failed_uploads()
 
         if show_status:
             if not self.config.is_monitoring_active:
@@ -484,13 +589,23 @@ class TrayController(QObject):
 
         self._is_authenticated = True
         self.environment = environment
+        self.config.retry = self._retry_config_for_environment(environment)
         self.irods_environment_store.save(self._without_password(environment))
         self.upload_environment_updated.emit(environment)
         self.window.set_irods_environment(environment)
+        self.window.set_retry_config(self.config.retry)
         self.window.append_activity(
             f"signed in as {environment.irods_user_name}@{environment.irods_host}:{environment.irods_port}"
         )
         self._sync_from_config()
+
+    def _retry_config_for_environment(self, environment: IRODSEnvironment):
+        """Return the saved retry settings for the current user, if any."""
+
+        user_key = build_retry_settings_user_key(environment)
+        if user_key in self.config.retry_by_user:
+            return normalize_retry_config(self.config.retry_by_user[user_key])
+        return normalize_retry_config(None)
 
     def _without_password(self, environment: IRODSEnvironment) -> IRODSEnvironment:
         """Return an environment snapshot safe to persist to disk."""
@@ -508,6 +623,11 @@ class TrayController(QObject):
 
         entry_type = "folder" if is_directory else "file"
         self.window.append_activity(f"{event_type}: {entry_type} -> {path}")
+        if is_directory:
+            return
+
+        if event_type in {"deleted", "moved"}:
+            self._remove_failed_upload_for_missing_path(path)
 
     def _queue_ingestion(self, path: str) -> None:
         """Forward created and moved files to the iRODS worker thread once per path."""
@@ -530,16 +650,65 @@ class TrayController(QObject):
             return
         if normalized_path in self._queued_uploads:
             return
+        if normalized_path in self._failed_uploads:
+            self._failed_uploads.pop(normalized_path, None)
+            self._refresh_failed_uploads()
 
-        self._queued_uploads[normalized_path] = monitored_directory.source_directory
-        self.window.append_activity(f"queued upload -> {normalized_path}")
-        self.queue_upload.emit(
-            normalized_path,
-            monitored_directory.source_directory,
-            monitored_directory.target_collection,
-            monitored_directory.post_upload_action,
-            monitored_directory.post_upload_destination,
+        job = UploadJob(
+            local_path=normalized_path,
+            monitored_root=monitored_directory.source_directory,
+            target_collection=monitored_directory.target_collection,
+            post_upload_action=monitored_directory.post_upload_action,
+            post_upload_destination=monitored_directory.post_upload_destination,
+            max_attempts=max(1, self.config.retry.attempts + 1),
         )
+        self._queued_uploads[normalized_path] = job
+        self.window.append_activity(f"queued upload -> {normalized_path}")
+        self._dispatch_upload_job(job)
+
+    def _dispatch_upload_job(self, job: UploadJob) -> None:
+        """Send one upload attempt to the worker thread for the given job."""
+
+        self._failed_uploads.pop(job.local_path, None)
+        self._stop_retry_timer(job)
+        job.status = "queued"
+        self._refresh_failed_uploads()
+        self.queue_upload.emit(
+            job.local_path,
+            job.monitored_root,
+            job.target_collection,
+            job.post_upload_action,
+            job.post_upload_destination,
+        )
+
+    def retry_failed_upload(self, local_path: str) -> None:
+        """Move a terminally failed upload back into the active queue and retry it now."""
+
+        if not self.config.is_monitoring_active:
+            self.window.set_status_message(
+                "Enable monitoring before retrying uploads.",
+                is_error=True,
+            )
+            return
+
+        job = self._failed_uploads.pop(local_path, None)
+        if job is None:
+            self.window.set_status_message("Select a failed upload to retry.", is_error=True)
+            self._refresh_failed_uploads()
+            return
+
+        job.attempt_number = 1
+        job.max_attempts = max(1, self.config.retry.attempts + 1)
+        job.logical_path = ""
+        job.last_error = ""
+        job.status = "queued"
+        if not self._refresh_upload_job_destination(job):
+            self._failed_uploads[local_path] = job
+            self._refresh_failed_uploads()
+            return
+        self._queued_uploads[local_path] = job
+        self.window.append_activity(f"manual retry -> {local_path}")
+        self._dispatch_upload_job(job)
 
     def _handle_monitor_error(self, message: str) -> None:
         """Surface monitoring failures in both the status area and activity log."""
@@ -561,28 +730,21 @@ class TrayController(QObject):
             return
 
         self._persist_and_sync()
+        self._remove_failed_uploads_for_directory(old_path)
         self.window.set_status_message(f"Updated monitored folder to {new_path}")
         self.window.append_activity(f"folder renamed -> {old_path} to {new_path}")
 
     def _handle_monitored_directory_moved(self, old_path: str, new_path: str) -> None:
         """Refresh the UI and notify the user when a watched folder leaves its parent."""
-        
-        print(
-            "[tray] handle monitored directory moved "
-            f"old_path={old_path} ",
-            f"new_path={new_path} ",
-            flush=True,
-        )
 
         if not any(
             directory.source_directory == old_path
             for directory in self.config.monitored_directories
         ):
-            print("[tray] path NOT in monitored_directories ", flush=True,)
             return
 
-        print("[tray] path in monitored_directories ", flush=True,)
         self._cancel_uploads_for_directory(old_path)
+        self._remove_failed_uploads_for_directory(old_path)
         self._sync_from_config(show_status=False)
         self.window.set_status_message(
             f"{old_path} was moved and is no longer being tracked.",
@@ -593,23 +755,15 @@ class TrayController(QObject):
 
     def _handle_monitored_directory_deleted(self, path: str) -> None:
         """Refresh the UI when a watched folder is deleted and can no longer be read."""
-        
-        print(
-            "[tray] handle monitored directory deleted "
-            f"path={path} ",
-            flush=True,
-        )
 
         if not any(
             directory.source_directory == path
             for directory in self.config.monitored_directories
         ):
-            print("[tray] path NOT in monitored_directories ", flush=True,)
             return
 
-        print("[tray] path in monitored_directories ", flush=True,)
-
         self._cancel_uploads_for_directory(path)
+        self._remove_failed_uploads_for_directory(path)
         self._sync_from_config(show_status=False)
         self.window.set_status_message(
             f"{path} is no longer available and can no longer be tracked.",
@@ -620,6 +774,11 @@ class TrayController(QObject):
 
     def _handle_upload_started(self, local_path: str, logical_path: str) -> None:
         """Surface the start of an iRODS upload in the tray window."""
+
+        job = self._queued_uploads.get(local_path)
+        if job is not None:
+            job.status = "uploading"
+            job.logical_path = logical_path
 
         self.window.set_status_message(f"Uploading {Path(local_path).name} to iRODS...")
         self.window.append_activity(f"uploading -> {local_path} to {logical_path}")
@@ -645,6 +804,10 @@ class TrayController(QObject):
     def _handle_upload_paths_resolved(self, local_path: str, logical_path: str) -> None:
         """Record the final paths used for the imminent iRODS put operation."""
 
+        job = self._queued_uploads.get(local_path)
+        if job is not None:
+            job.logical_path = logical_path
+
         self.window.append_activity(
             f"iRODS put paths -> local={local_path} logical={logical_path}"
         )
@@ -652,7 +815,12 @@ class TrayController(QObject):
     def _handle_upload_finished(self, local_path: str, logical_path: str) -> None:
         """Clear queue tracking and log successful background uploads."""
 
-        self._queued_uploads.pop(local_path, None)
+        job = self._queued_uploads.pop(local_path, None)
+        if job is not None:
+            self._stop_retry_timer(job)
+            job.status = "finished"
+            job.logical_path = logical_path
+
         self.window.set_status_message(f"Uploaded {Path(local_path).name} to iRODS.")
         self.window.append_activity(f"uploaded -> {local_path} to {logical_path}")
 
@@ -663,16 +831,46 @@ class TrayController(QObject):
         self.window.append_activity(f"upload warning: {local_path} ({message})")
 
     def _handle_upload_failed(self, local_path: str, message: str) -> None:
-        """Clear queue tracking and surface upload failures to the user."""
+        """Retry failed uploads later until the configured attempt limit is reached."""
 
-        self._queued_uploads.pop(local_path, None)
+        job = self._queued_uploads.get(local_path)
+        if job is not None:
+            job.last_error = message
+            if not self.config.is_monitoring_active:
+                self._queued_uploads.pop(local_path, None)
+                self._stop_retry_timer(job)
+                job.status = "failed"
+                self._move_to_failed_uploads(job)
+                self.window.set_status_message(
+                    f"Monitoring paused before retrying {Path(local_path).name}.",
+                    is_error=True,
+                )
+                self.window.append_activity(
+                    f"upload failed while paused -> {local_path} ({message})"
+                )
+                return
+            if job.attempt_number < job.max_attempts:
+                self.window.append_activity(f"upload failed: {local_path} ({message})")
+                self._schedule_upload_retry(job)
+                return
+
+            self._queued_uploads.pop(local_path, None)
+            self._stop_retry_timer(job)
+            job.status = "failed"
+            self._move_to_failed_uploads(job)
+
         self.window.set_status_message(message, is_error=True)
         self.window.append_activity(f"upload failed: {local_path} ({message})")
 
     def _handle_upload_cancelled(self, local_path: str, message: str) -> None:
         """Drop queued uploads cleanly once a monitored folder becomes unavailable."""
 
-        self._queued_uploads.pop(local_path, None)
+        job = self._queued_uploads.pop(local_path, None)
+        if job is not None:
+            self._stop_retry_timer(job)
+            job.status = "cancelled"
+            job.last_error = message
+
         self.window.append_activity(f"upload cancelled: {local_path} ({message})")
 
     def _match_monitored_directory(self, path: str) -> MonitoredDirectory | None:
@@ -696,10 +894,211 @@ class TrayController(QObject):
     def _cancel_uploads_for_directory(self, directory: str) -> None:
         """Stop any later queued uploads for a monitored folder that vanished."""
 
-        self.upload_worker.cancel_directory_uploads(directory)
+        normalized_directory = str(Path(directory).expanduser().resolve(strict=False))
+        self.upload_worker.cancel_directory_uploads(normalized_directory)
+
+        for local_path, job in list(self._queued_uploads.items()):
+            if job.monitored_root != normalized_directory or job.status == "uploading":
+                continue
+            self._stop_retry_timer(job)
+            self._queued_uploads.pop(local_path, None)
+
         self.window.append_activity(
-            f"cancelling queued uploads for unavailable folder -> {directory}"
+            f"cancelling queued uploads for unavailable folder -> {normalized_directory}"
         )
+
+    def _schedule_upload_retry(self, job: UploadJob) -> None:
+        """Retry a failed upload later without blocking the shared upload thread."""
+
+        retry_config = normalize_retry_config(self.config.retry)
+        self._stop_retry_timer(job)
+        delay_seconds = max(
+            0.0,
+            retry_config.first_delay_in_seconds
+            * (retry_config.backoff_multiplier ** max(0, job.attempt_number - 1)),
+        )
+        next_attempt_number = job.attempt_number + 1
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda local_path=job.local_path: self._retry_upload_job(local_path))
+        job.retry_timer = timer
+        job.status = "retry_wait"
+
+        delay_label = self._format_retry_delay(delay_seconds)
+        self.window.set_status_message(
+            f"Retrying {Path(job.local_path).name} in {delay_label}.",
+            is_error=True,
+        )
+        self.window.append_activity(
+            f"retry scheduled -> {job.local_path} (attempt {next_attempt_number}/{job.max_attempts} in {delay_label})"
+        )
+        timer.start(max(0, int(delay_seconds * 1000)))
+
+    def _retry_upload_job(self, local_path: str) -> None:
+        """Dispatch the next queued upload attempt once its retry timer fires."""
+
+        job = self._queued_uploads.get(local_path)
+        if job is None:
+            return
+
+        self._stop_retry_timer(job)
+        if not self.config.is_monitoring_active:
+            self._queued_uploads.pop(local_path, None)
+            job.status = "failed"
+            if not job.last_error:
+                job.last_error = "Monitoring was paused before retry started."
+            self._move_to_failed_uploads(job)
+            self.window.set_status_message(
+                f"Monitoring paused before retrying {Path(local_path).name}.",
+                is_error=True,
+            )
+            self.window.append_activity(
+                f"retry cancelled while paused -> {job.local_path}"
+            )
+            return
+        if not self._is_authenticated:
+            self._queued_uploads.pop(local_path, None)
+            job.status = "cancelled"
+            job.last_error = "User signed out before retry started."
+            return
+
+        if not self._refresh_upload_job_destination(job):
+            self._queued_uploads.pop(local_path, None)
+            job.status = "failed"
+            self._move_to_failed_uploads(job)
+            return
+
+        job.attempt_number += 1
+        self.window.append_activity(
+            f"retrying upload -> {job.local_path} (attempt {job.attempt_number}/{job.max_attempts})"
+        )
+        self._dispatch_upload_job(job)
+
+    def _refresh_upload_job_destination(self, job: UploadJob) -> bool:
+        """Refresh a retrying upload job from the latest monitored-folder settings."""
+
+        monitored_directory = self._match_monitored_directory(job.local_path)
+        if monitored_directory is None:
+            message = (
+                f"{Path(job.local_path).name} is no longer inside a monitored folder."
+            )
+            job.last_error = message
+            self.window.set_status_message(message, is_error=True)
+            self.window.append_activity(f"warning: {message}")
+            return False
+
+        if not monitored_directory.target_collection:
+            message = (
+                f"No target collection configured for {monitored_directory.source_directory}."
+            )
+            job.last_error = message
+            self.window.set_status_message(message, is_error=True)
+            self.window.append_activity(f"warning: {message}")
+            return False
+
+        job.monitored_root = monitored_directory.source_directory
+        job.target_collection = monitored_directory.target_collection
+        return True
+
+    def _move_to_failed_uploads(self, job: UploadJob) -> None:
+        """Store a terminally failed upload separately from active queued jobs."""
+
+        self._stop_retry_timer(job)
+        self._failed_uploads[job.local_path] = job
+        self._refresh_failed_uploads()
+
+    def _remove_failed_upload_for_missing_path(self, path: str) -> None:
+        """Drop a failed upload entry once its source file no longer exists there."""
+
+        normalized_path = str(Path(path).expanduser().resolve(strict=False))
+        removed_job = self._failed_uploads.pop(normalized_path, None)
+        if removed_job is None:
+            return
+
+        self._refresh_failed_uploads()
+        self.window.append_activity(
+            f"failed upload removed -> {normalized_path} (source file no longer available)"
+        )
+
+    def _remove_failed_uploads_for_directory(self, directory: str) -> None:
+        """Drop failed uploads that belong to a monitored folder no longer at that path."""
+
+        normalized_directory = str(Path(directory).expanduser().resolve(strict=False))
+        removed_paths = [
+            local_path
+            for local_path, job in self._failed_uploads.items()
+            if job.monitored_root == normalized_directory
+        ]
+        if not removed_paths:
+            return
+
+        for local_path in removed_paths:
+            self._failed_uploads.pop(local_path, None)
+
+        self._refresh_failed_uploads()
+        self.window.append_activity(
+            f"cleared {len(removed_paths)} failed upload entr{'y' if len(removed_paths) == 1 else 'ies'} for unavailable folder -> {normalized_directory}"
+        )
+
+    def _pause_pending_retries(self) -> None:
+        """Move retry-wait uploads back to the failed list when monitoring is paused."""
+
+        paused_jobs = [
+            job
+            for job in list(self._queued_uploads.values())
+            if job.status == "retry_wait"
+        ]
+        if not paused_jobs:
+            return
+
+        for job in paused_jobs:
+            self._queued_uploads.pop(job.local_path, None)
+            self._stop_retry_timer(job)
+            job.status = "failed"
+            if not job.last_error:
+                job.last_error = "Monitoring was paused before retry started."
+            self._failed_uploads[job.local_path] = job
+
+        self._refresh_failed_uploads()
+        self.window.append_activity(
+            f"paused {len(paused_jobs)} pending upload retr{'y' if len(paused_jobs) == 1 else 'ies'}"
+        )
+
+    def _stop_retry_timer(self, job: UploadJob) -> None:
+        """Dispose of any pending retry timer attached to an upload job."""
+
+        if job.retry_timer is None:
+            return
+        job.retry_timer.stop()
+        job.retry_timer.deleteLater()
+        job.retry_timer = None
+
+    def _clear_upload_jobs(self) -> None:
+        """Drop controller-side upload jobs and stop any pending retry timers."""
+
+        for job in self._queued_uploads.values():
+            self._stop_retry_timer(job)
+        for job in self._failed_uploads.values():
+            self._stop_retry_timer(job)
+        self._queued_uploads.clear()
+        self._failed_uploads.clear()
+        self._refresh_failed_uploads()
+
+    def _refresh_failed_uploads(self) -> None:
+        """Push the latest failed-upload snapshot into the Overview tab."""
+
+        failed_upload_rows = [
+            (job.local_path, job.last_error, job.attempt_number, job.max_attempts)
+            for job in reversed(list(self._failed_uploads.values()))
+        ]
+        self.window.set_failed_uploads(failed_upload_rows)
+
+    def _format_retry_delay(self, delay_seconds: float) -> str:
+        """Return a compact delay label for retry-related UI messages."""
+
+        if delay_seconds.is_integer():
+            return f"{int(delay_seconds)}s"
+        return f"{delay_seconds:.1f}s"
 
     def _find_post_upload_destination_conflict(
         self,
@@ -795,4 +1194,6 @@ class TrayController(QObject):
                 on_failed=lambda _args: None,
             )
         except Exception as exc:
-            print(f"warning: failed to show folder notification ({exc})", flush=True)
+            self.window.append_activity(
+                f"warning: failed to show folder notification ({exc})"
+            )
