@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFrame,
     QFileDialog,
     QFormLayout,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +34,7 @@ from config import (
     DEFAULT_POST_UPLOAD_ACTION,
     IRODSEnvironment,
     MonitoredDirectory,
+    RetryConfig,
     normalize_directory,
     normalize_irods_zone_name,
 )
@@ -826,7 +829,8 @@ class SettingsWindow(QWidget):
     monitoring_toggled = Signal(bool)
     add_folder_requested = Signal(str, str, bool, str, str)
     remove_folder_requested = Signal(str)
-    save_irods_requested = Signal()
+    retry_failed_upload_requested = Signal(str)
+    save_settings_requested = Signal()
 
     def __init__(self) -> None:
         """Construct the minimalist settings UI used by the tray application."""
@@ -851,6 +855,34 @@ class SettingsWindow(QWidget):
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("settingsStatusLabel")
+
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("settingsTabs")
+
+        overview_tab = QWidget()
+        overview_layout = QVBoxLayout(overview_tab)
+        overview_layout.setContentsMargins(0, 0, 0, 0)
+        overview_layout.setSpacing(14)
+
+        session_card = QFrame()
+        session_card.setFrameShape(QFrame.Shape.StyledPanel)
+        session_card.setObjectName("sessionSummaryCard")
+
+        session_layout = QVBoxLayout(session_card)
+        session_layout.setContentsMargins(16, 16, 16, 16)
+        session_layout.setSpacing(8)
+
+        session_title = QLabel("iRODS session")
+        session_title.setObjectName("irodsCardTitle")
+
+        self.session_summary_label = QLabel("No iRODS session is configured")
+        self.session_summary_label.setWordWrap(True)
+        self.session_zone_label = QLabel("Zone: not configured")
+        self.session_zone_label.setWordWrap(True)
+
+        session_layout.addWidget(session_title)
+        session_layout.addWidget(self.session_summary_label)
+        session_layout.addWidget(self.session_zone_label)
 
         irods_card = QFrame()
         irods_card.setFrameShape(QFrame.Shape.StyledPanel)
@@ -880,16 +912,46 @@ class SettingsWindow(QWidget):
         form_layout.addRow("Password", self.irods_password_input)
         form_layout.addRow("Zone", self.irods_zone_name_input)
 
-        irods_button_row = QHBoxLayout()
-        irods_button_row.setSpacing(10)
-        self.save_irods_button = QPushButton("Save iRODS Settings")
-        self.save_irods_button.clicked.connect(self._emit_save_irods_requested)
-        irods_button_row.addWidget(self.save_irods_button)
-        irods_button_row.addStretch(1)
-
         irods_layout.addWidget(irods_title)
         irods_layout.addLayout(form_layout)
-        irods_layout.addLayout(irods_button_row)
+
+        retry_card = QFrame()
+        retry_card.setFrameShape(QFrame.Shape.StyledPanel)
+        retry_card.setObjectName("retryCard")
+
+        retry_layout = QVBoxLayout(retry_card)
+        retry_layout.setContentsMargins(16, 16, 16, 16)
+        retry_layout.setSpacing(12)
+
+        retry_title = QLabel("Upload retry")
+        retry_title.setObjectName("directoryCardTitle")
+
+        retry_form_layout = QFormLayout()
+        retry_form_layout.setSpacing(10)
+        retry_form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self.retry_attempts_input = QSpinBox()
+        self.retry_attempts_input.setRange(0, 100)
+        self.retry_first_delay_input = QSpinBox()
+        self.retry_first_delay_input.setRange(0, 3600)
+        self.retry_backoff_multiplier_input = QDoubleSpinBox()
+        self.retry_backoff_multiplier_input.setRange(1.0, 100.0)
+        self.retry_backoff_multiplier_input.setDecimals(2)
+        self.retry_backoff_multiplier_input.setSingleStep(0.1)
+
+        retry_form_layout.addRow("Retry attempts", self.retry_attempts_input)
+        retry_form_layout.addRow("Initial delay (s)", self.retry_first_delay_input)
+        retry_form_layout.addRow("Backoff multiplier", self.retry_backoff_multiplier_input)
+
+        retry_layout.addWidget(retry_title)
+        retry_layout.addLayout(retry_form_layout)
+
+        settings_button_row = QHBoxLayout()
+        settings_button_row.setSpacing(10)
+        self.save_settings_button = QPushButton("Save Settings")
+        self.save_settings_button.clicked.connect(self._emit_save_settings_requested)
+        settings_button_row.addWidget(self.save_settings_button)
+        settings_button_row.addStretch(1)
 
         directory_card = QFrame()
         directory_card.setFrameShape(QFrame.Shape.StyledPanel)
@@ -923,11 +985,56 @@ class SettingsWindow(QWidget):
         directory_layout.addWidget(self.directory_list)
         directory_layout.addLayout(button_row)
 
+        failed_uploads_card = QFrame()
+        failed_uploads_card.setFrameShape(QFrame.Shape.StyledPanel)
+        failed_uploads_card.setObjectName("failedUploadsCard")
+
+        failed_uploads_layout = QVBoxLayout(failed_uploads_card)
+        failed_uploads_layout.setContentsMargins(16, 16, 16, 16)
+        failed_uploads_layout.setSpacing(12)
+
+        failed_uploads_title = QLabel("Failed uploads")
+        failed_uploads_title.setObjectName("directoryCardTitle")
+
+        self.failed_uploads_list = QListWidget()
+        self.failed_uploads_list.setMaximumHeight(120)
+        self.failed_uploads_list.currentItemChanged.connect(self._update_retry_failed_button_state)
+
+        failed_uploads_button_row = QHBoxLayout()
+        failed_uploads_button_row.setSpacing(10)
+        self.retry_failed_upload_button = QPushButton("Retry Now")
+        self.retry_failed_upload_button.clicked.connect(self._emit_retry_failed_upload_requested)
+        self.retry_failed_upload_button.setEnabled(False)
+        failed_uploads_button_row.addWidget(self.retry_failed_upload_button)
+        failed_uploads_button_row.addStretch(1)
+
+        failed_uploads_layout.addWidget(failed_uploads_title)
+        failed_uploads_layout.addWidget(self.failed_uploads_list)
+        failed_uploads_layout.addLayout(failed_uploads_button_row)
+
         activity_title = QLabel("Recent activity")
         activity_title.setObjectName("activityTitle")
 
         self.activity_list = QListWidget()
         self.activity_list.setMaximumHeight(140)
+
+        overview_layout.addWidget(session_card)
+        overview_layout.addWidget(directory_card, 1)
+        overview_layout.addWidget(failed_uploads_card)
+        overview_layout.addWidget(activity_title)
+        overview_layout.addWidget(self.activity_list)
+
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(14)
+        settings_layout.addWidget(irods_card)
+        settings_layout.addWidget(retry_card)
+        settings_layout.addLayout(settings_button_row)
+        settings_layout.addStretch(1)
+
+        self.tabs.addTab(overview_tab, "Overview")
+        self.tabs.addTab(settings_tab, "Settings")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -936,10 +1043,7 @@ class SettingsWindow(QWidget):
         layout.addWidget(self.subtitle_label)
         layout.addWidget(self.monitor_toggle)
         layout.addWidget(self.status_label)
-        layout.addWidget(irods_card)
-        layout.addWidget(directory_card, 1)
-        layout.addWidget(activity_title)
-        layout.addWidget(self.activity_list)
+        layout.addWidget(self.tabs, 1)
 
     def set_monitoring_active(self, is_active: bool) -> None:
         """Update the checkbox state without re-emitting the user-facing toggle signal."""
@@ -993,6 +1097,33 @@ class SettingsWindow(QWidget):
         self.irods_password_input.clear()
         self.irods_zone_name_input.setText(environment.irods_zone_name)
         self._irods_zone_for_new_folders = environment.irods_zone_name
+        if environment.irods_user_name and environment.irods_host:
+            self.session_summary_label.setText(
+                f"Signed in as {environment.irods_user_name}@{environment.irods_host}:{environment.irods_port}"
+            )
+        else:
+            self.session_summary_label.setText("No iRODS session is configured")
+        if environment.irods_zone_name:
+            self.session_zone_label.setText(f"Zone: {environment.irods_zone_name}")
+        else:
+            self.session_zone_label.setText("Zone: not configured")
+
+    def set_failed_uploads(self, failed_uploads: list[tuple[str, str, int, int]]) -> None:
+        """Refresh the failed upload list and selection-dependent retry action."""
+
+        self.failed_uploads_list.clear()
+        for local_path, last_error, attempt_number, max_attempts in failed_uploads:
+            item = QListWidgetItem(
+                f"{Path(local_path).name} ({attempt_number}/{max_attempts})"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, local_path)
+            item.setToolTip(
+                f"File: {local_path}\n"
+                f"Last error: {last_error or 'Unknown error'}\n"
+                f"Attempts used: {attempt_number}/{max_attempts}"
+            )
+            self.failed_uploads_list.addItem(item)
+        self._update_retry_failed_button_state()
 
     def get_irods_environment(self) -> IRODSEnvironment:
         """Collect the current form values into the config dataclass."""
@@ -1003,6 +1134,22 @@ class SettingsWindow(QWidget):
             irods_user_name=self.irods_user_name_input.text().strip(),
             irods_password=self.irods_password_input.text(),
             irods_zone_name=self.irods_zone_name_input.text().strip(),
+        )
+
+    def set_retry_config(self, retry: RetryConfig) -> None:
+        """Populate the retry controls from the persisted app configuration."""
+
+        self.retry_attempts_input.setValue(retry.attempts)
+        self.retry_first_delay_input.setValue(retry.first_delay_in_seconds)
+        self.retry_backoff_multiplier_input.setValue(retry.backoff_multiplier)
+
+    def get_retry_config(self) -> RetryConfig:
+        """Collect the current retry controls into the config dataclass."""
+
+        return RetryConfig(
+            attempts=self.retry_attempts_input.value(),
+            first_delay_in_seconds=self.retry_first_delay_input.value(),
+            backoff_multiplier=self.retry_backoff_multiplier_input.value(),
         )
 
     def set_status_message(self, message: str, *, is_error: bool = False) -> None:
@@ -1053,12 +1200,26 @@ class SettingsWindow(QWidget):
         directory = item.data(Qt.ItemDataRole.UserRole)
         self.remove_folder_requested.emit(directory)
 
-    def _emit_save_irods_requested(self, _checked: bool = False) -> None:
-        """Notify the controller that the user wants to persist iRODS settings."""
+    def _emit_retry_failed_upload_requested(self, _checked: bool = False) -> None:
+        """Emit the selected failed upload so the controller can retry it now."""
 
-        self.save_irods_requested.emit()
+        item = self.failed_uploads_list.currentItem()
+        if item is None:
+            return
+        local_path = item.data(Qt.ItemDataRole.UserRole)
+        self.retry_failed_upload_requested.emit(local_path)
+
+    def _emit_save_settings_requested(self, _checked: bool = False) -> None:
+        """Notify the controller that the user wants to persist all settings."""
+
+        self.save_settings_requested.emit()
 
     def _update_remove_button_state(self, *_args) -> None:
         """Enable removal only when the user has a directory selected in the list."""
 
         self.remove_button.setEnabled(self.directory_list.currentItem() is not None)
+
+    def _update_retry_failed_button_state(self, *_args) -> None:
+        """Enable retry only when the user has a failed upload selected in the list."""
+
+        self.retry_failed_upload_button.setEnabled(self.failed_uploads_list.currentItem() is not None)

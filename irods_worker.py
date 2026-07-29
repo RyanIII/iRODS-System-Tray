@@ -19,7 +19,7 @@ from config import (
 
 
 class IRODSUploadWorker(QObject):
-    """Perform blocking iRODS authentication and uploads away from the GUI thread."""
+    """Perform a single iRODS upload attempt on a worker thread so the GUI stays responsive."""
 
     upload_started = Signal(str, str)
     upload_progress = Signal(str, str, int, int)
@@ -73,7 +73,7 @@ class IRODSUploadWorker(QObject):
         post_upload_action: str,
         post_upload_destination: str,
     ) -> None:
-        """Upload a created or moved file into the configured iRODS collection."""
+        """Attempt one upload for a created or moved file into iRODS."""
 
         local_file = Path(local_path).expanduser().resolve(strict=False)
         monitored_directory = Path(monitored_root).expanduser().resolve(strict=False)
@@ -231,7 +231,6 @@ class IRODSUploadWorker(QObject):
             self.upload_debug.emit(
                 f"upload debug -> stage=before put local={local_file} logical={logical_path}"
             )
-            print(f"iRODS put: local={local_file} logical={logical_path}", flush=True)
             session.data_objects.put(str(local_file), logical_path)
             self.upload_debug.emit("upload debug -> stage=put completed")
             self.upload_progress.emit(str(local_file), logical_path, total_bytes, total_bytes)

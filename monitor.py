@@ -68,23 +68,12 @@ class ParentDirectoryEventHandler(FileSystemEventHandler):
         """Forward moved directory paths so the manager can classify them."""
 
         super().on_moved(event)
-        print(
-            "[parent-monitor] moved event "
-            f"is_directory={event.is_directory} src={event.src_path!r} "
-            f"dest={getattr(event, 'dest_path', None)!r}",
-            flush=True,
-        )
         self.bridge.directory_relocated.emit(event.src_path, event.dest_path)
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         """Forward deleted directory paths so the manager can stop stale watches."""
 
         super().on_deleted(event)
-        print(
-            "[parent-monitor] deleted event "
-            f"is_directory={event.is_directory} src={event.src_path!r}",
-            flush=True,
-        )
         self.bridge.directory_deleted.emit(event.src_path)
 
 
@@ -243,38 +232,15 @@ class MonitorManager(QObject):
         source_parent = str(Path(normalized_source).parent)
         destination_parent = str(Path(normalized_destination).parent)
 
-        print(
-            "[parent-monitor] classify moved "
-            f"source={normalized_source!r} destination={normalized_destination!r} "
-            f"source_parent={source_parent!r} destination_parent={destination_parent!r} "
-            f"tracked_children={sorted(self._parent_children.get(source_parent, set()))!r}",
-            flush=True,
-        )
-
         if normalized_source not in self._parent_children.get(source_parent, set()):
-            print(
-                "[parent-monitor] ignoring moved event for untracked directory "
-                f"{normalized_source!r}",
-                flush=True,
-            )
             return
 
         self._remove_directory_watch(normalized_source)
 
         if source_parent == destination_parent:
-            print(
-                "[parent-monitor] classified as rename "
-                f"old={normalized_source!r} new={normalized_destination!r}",
-                flush=True,
-            )
             self.monitored_directory_renamed.emit(normalized_source, normalized_destination)
             return
 
-        print(
-            "[parent-monitor] classified as move-away "
-            f"old={normalized_source!r} new={normalized_destination!r}",
-            flush=True,
-        )
         self.monitored_directory_moved.emit(normalized_source, normalized_destination)
 
     def _handle_directory_deleted(self, path: str) -> None:
@@ -283,26 +249,10 @@ class MonitorManager(QObject):
         normalized_path = str(Path(path).expanduser().resolve(strict=False))
         parent = str(Path(normalized_path).parent)
 
-        print(
-            "[parent-monitor] classify deleted "
-            f"path={normalized_path!r} parent={parent!r} "
-            f"tracked_children={sorted(self._parent_children.get(parent, set()))!r}",
-            flush=True,
-        )
-
         if normalized_path not in self._parent_children.get(parent, set()):
-            print(
-                "[parent-monitor] ignoring deleted event for untracked directory "
-                f"{normalized_path!r}",
-                flush=True,
-            )
             return
 
         self._remove_directory_watch(normalized_path)
-        print(
-            f"[parent-monitor] classified as deleted path={normalized_path!r}",
-            flush=True,
-        )
         self.monitored_directory_deleted.emit(normalized_path)
 
     def _build_parent_map(
@@ -330,21 +280,9 @@ class MonitorManager(QObject):
 
         watch = self._directory_watches.pop(directory, None)
         if watch is None or self._observer is None:
-            print(
-                "[parent-monitor] no directory watch to remove "
-                f"directory={directory!r} observer_running={self._observer is not None}",
-                flush=True,
-            )
             return
 
         try:
             self._observer.unschedule(watch)
-            print(
-                f"[parent-monitor] removed directory watch for {directory!r}",
-                flush=True,
-            )
         except KeyError:
-            print(
-                f"[parent-monitor] directory watch already missing for {directory!r}",
-                flush=True,
-            )
+            pass
