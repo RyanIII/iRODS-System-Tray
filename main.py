@@ -8,7 +8,7 @@ from pathlib import Path
 from string import Template
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QGuiApplication, QPalette
+from PySide6.QtGui import QColor, QFontInfo, QGuiApplication, QPalette
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from tray import TrayController
@@ -48,6 +48,27 @@ THEME_TOKENS = {
         "disabled_text": "#ffffff",
     },
 }
+
+
+# Stylesheet font sizes, keyed by the token name theme.qss.template refers to. Each
+# value is a multiple of the font size the OS gives the application, so the whole scale
+# moves together with the system text size.
+FONT_SIZE_RATIOS = {
+    "font_display": 1.71,
+    "font_lg": 1.07,
+    "font_md": 1.0,
+    "font_sm": 0.93,
+}
+
+
+def _font_size_tokens_from_system_font(app: QApplication) -> dict[str, str]:
+    """Derive the stylesheet's font sizes from the font the OS handed the application."""
+
+    base_point_size = QFontInfo(app.font()).pointSize() or 13
+    return {
+        name: f"{max(round(base_point_size * ratio), 8)}pt"
+        for name, ratio in FONT_SIZE_RATIOS.items()
+    }
 
 
 def _palette_from_tokens(tokens: dict[str, str]) -> QPalette:
@@ -93,7 +114,8 @@ def _apply_theme(app: QApplication) -> None:
     is_dark = QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
     tokens = THEME_TOKENS["dark" if is_dark else "light"]
     app.setPalette(_palette_from_tokens(tokens))
-    app.setStyleSheet(Template(THEME_TEMPLATE_PATH.read_text()).substitute(tokens))
+    substitutions = {**tokens, **_font_size_tokens_from_system_font(app)}
+    app.setStyleSheet(Template(THEME_TEMPLATE_PATH.read_text()).substitute(substitutions))
 
 
 def main() -> int:

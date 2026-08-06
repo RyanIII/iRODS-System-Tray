@@ -1,34 +1,34 @@
 QWidget#settingsWindow {
     background: $window_bg;
     color: $text;
-    font-size: 14px;
+    font-size: $font_md;
 }
 
 QLabel#settingsTitleLabel {
     color: $text;
-    font-size: 24px;
+    font-size: $font_display;
     font-weight: 600;
 }
 QLabel#settingsSubtitleLabel {
     color: $muted;
-    font-size: 13px;
+    font-size: $font_sm;
 }
 QCheckBox#monitorToggleCheckbox {
     color: $text;
-    font-size: 15px;
+    font-size: $font_lg;
     font-weight: 600;
     padding: 6px 0;
 }
 QLabel#settingsStatusLabel {
     color: $muted;
-    font-size: 13px;
+    font-size: $font_sm;
 }
 QLabel#settingsStatusLabel[error="true"] {
     color: $error;
 }
 QLabel#validationLabel {
     color: $error;
-    font-size: 13px;
+    font-size: $font_sm;
 }
 
 QFrame#irodsCard,
@@ -41,7 +41,7 @@ QLabel#irodsCardTitle,
 QLabel#directoryCardTitle,
 QLabel#activityTitle {
     color: $text;
-    font-size: 15px;
+    font-size: $font_lg;
     font-weight: 600;
 }
 
