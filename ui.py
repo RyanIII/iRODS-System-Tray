@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import socket
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
@@ -1325,7 +1326,11 @@ class SettingsWindow(QWidget):
     def append_activity(self, message: str) -> None:
         """Prepend a new activity message and keep only a short rolling history."""
 
-        self.activity_list.insertItem(0, message)
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        timestamped_message = f"{timestamp} - {message}"
+        self.activity_list.insertItem(0, timestamped_message)
         while self.activity_list.count() > 50:
             self.activity_list.takeItem(self.activity_list.count() - 1)
 
