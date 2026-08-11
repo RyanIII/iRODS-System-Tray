@@ -12,6 +12,17 @@ Run the application:
 python main.py
 ```
 
+Run the tests:
+
+```bash
+pytest tests/
+```
+
+The tests stub the iRODS session and need no server. Tests that upload to a live zone
+are skipped unless `IRODS_TEST_LIVE_SERVER` is set; export that along with the other
+`IRODS_TEST_*` variables listed in `tests/conftest.py` to run them against a real
+deployment.
+
 The app persists monitored folders and the global monitoring toggle in `app_state.json`.
 When background monitoring is enabled it also watches each monitored folder's parent
 directory so it can detect folder renames and moved-away folders.
