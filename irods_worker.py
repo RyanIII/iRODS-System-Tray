@@ -11,6 +11,7 @@ from threading import Lock
 from PySide6.QtCore import QObject, Signal, Slot
 
 from config import (
+    DEFAULT_POST_UPLOAD_ACTION,
     IRODSEnvironment,
     normalize_file_path,
     normalize_irods_collection,
@@ -81,6 +82,10 @@ class IRODSUploadWorker(QObject):
         environment = self._copy_environment(self._environment)
         normalized_action = normalize_post_upload_action(post_upload_action)
         normalized_destination = normalize_file_path(post_upload_destination)
+        if normalized_action != "move":
+            normalized_destination = ""
+        elif not normalized_destination:
+            normalized_action = DEFAULT_POST_UPLOAD_ACTION
         stage = "initializing upload"
 
         if self._is_cancelled(normalized_monitored_root):
@@ -246,7 +251,7 @@ class IRODSUploadWorker(QObject):
         # The configured target is treated as pre-existing and is never auto-created.
         try:
             session.collections.get(normalized_target)
-        except Exception as exc: 
+        except Exception as exc:
             raise RuntimeError(
                 f"Configured target collection does not exist: {normalized_target}"
             ) from exc

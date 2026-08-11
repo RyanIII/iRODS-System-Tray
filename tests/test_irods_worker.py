@@ -367,22 +367,12 @@ def test_failed_cleanup_warns_without_failing_the_upload(tmp_path, monkeypatch):
     assert uploaded.exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='upload_file() does not apply the move-without-destination rule (issue #36)',
-)
 def test_move_without_a_destination_does_not_write_to_the_working_directory(
     tmp_path, monkeypatch
 ):
-    # upload_file() checks the action and the destination separately, so it misses the
-    # rule in config.py that turns a "move" with no destination back into the default
-    # action. The move branch then builds a path with nothing in front of it and the
-    # file lands wherever the app happens to be running from.
-    #
-    # Switching into a temporary folder first keeps that stray file out of the repo
-    # while this is still failing. The check is that the file does not escape into the
-    # working directory, so it holds whichever way the fix goes: falling back to
-    # delete, or raising so it surfaces as an upload warning.
+    # A "move" with no destination falls back to the default action, so the move branch
+    # never joins the file onto an empty path. The worker runs from a temporary working
+    # directory, which is where such a path would resolve to, and nothing is written there.
     watched_folder = (tmp_path / "watched").resolve()
     watched_folder.mkdir()
     uploaded = watched_folder / "report.csv"
